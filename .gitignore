@@ -1,4 +1,5 @@
 /copy
+/copy-asan
 /core
 /core.*
 __pycache__/

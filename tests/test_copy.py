@@ -1,3 +1,4 @@
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -5,7 +6,7 @@ import unittest
 
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
-COPY = PROJECT / "copy"
+COPY = pathlib.Path(os.environ.get("COPY_BIN", PROJECT / "copy"))
 
 
 class DirectoryCopyTests(unittest.TestCase):

@@ -9,7 +9,7 @@ import unittest
 
 
 PROJECT = pathlib.Path(__file__).resolve().parents[1]
-COPY = PROJECT / "copy"
+COPY = pathlib.Path(os.environ.get("COPY_BIN", PROJECT / "copy"))
 
 
 def resume_path(destination):

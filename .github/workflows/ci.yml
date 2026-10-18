@@ -20,3 +20,12 @@ jobs:
 
       - name: Run tests
         run: make test CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Werror -O2"
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run tests with address and undefined behavior sanitizers
+        run: make check
