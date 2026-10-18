@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 
@@ -5,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -210,6 +212,160 @@ static int prepare_disk_verification(int source_fd, int destination_fd,
     if (advice_result != 0) {
         errno = advice_result;
         print_error(source, "cannot discard cached data for");
+        return -1;
+    }
+    return 0;
+}
+
+static void progress_add_bytes(Progress *progress, uintmax_t amount);
+
+static int copy_range_buffered(int source_fd, int destination_fd,
+                               off_t source_offset, off_t destination_offset,
+                               off_t length, const char *source,
+                               const char *destination, Progress *progress)
+{
+    unsigned char buffer[128 * 1024];
+    off_t remaining = length;
+    while (remaining > 0) {
+        size_t requested = (uintmax_t)remaining > sizeof buffer
+                               ? sizeof buffer
+                               : (size_t)remaining;
+        ssize_t count = pread(source_fd, buffer, requested, source_offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            print_error(source, "cannot read");
+            return -1;
+        }
+        if (count == 0) {
+            errno = EIO;
+            print_error(source, "cannot read");
+            return -1;
+        }
+
+        ssize_t written_total = 0;
+        while (written_total < count) {
+            ssize_t written = pwrite(destination_fd, buffer + written_total,
+                                     (size_t)(count - written_total),
+                                     destination_offset + written_total);
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                print_error(destination, "cannot write");
+                return -1;
+            }
+            if (written == 0) {
+                errno = EIO;
+                print_error(destination, "cannot write");
+                return -1;
+            }
+            written_total += written;
+        }
+        source_offset += count;
+        destination_offset += count;
+        remaining -= count;
+        progress_add_bytes(progress, (uintmax_t)count);
+    }
+    return 0;
+}
+
+static int copy_range(int source_fd, int destination_fd, off_t source_offset,
+                      off_t destination_offset, off_t length,
+                      const char *source, const char *destination,
+                      Progress *progress)
+{
+    off_t remaining = length;
+    while (remaining > 0) {
+        size_t requested = (uintmax_t)remaining > 1024 * 1024
+                               ? 1024 * 1024
+                               : (size_t)remaining;
+        ssize_t copied = copy_file_range(source_fd, &source_offset,
+                                         destination_fd, &destination_offset,
+                                         requested, 0);
+        if (copied < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EXDEV || errno == ENOSYS || errno == EINVAL ||
+                errno == EOPNOTSUPP || errno == ENOTSUP) {
+                return copy_range_buffered(
+                    source_fd, destination_fd, source_offset,
+                    destination_offset, remaining, source, destination,
+                    progress);
+            }
+            print_error(destination, "cannot copy data to");
+            return -1;
+        }
+        if (copied == 0) {
+            return copy_range_buffered(source_fd, destination_fd,
+                                       source_offset, destination_offset,
+                                       remaining, source, destination,
+                                       progress);
+        }
+        remaining -= copied;
+        progress_add_bytes(progress, (uintmax_t)copied);
+    }
+    return 0;
+}
+
+static int copy_file_contents(int source_fd, int destination_fd,
+                              off_t start, off_t file_size,
+                              const char *source, const char *destination,
+                              Progress *progress)
+{
+    off_t offset = start;
+    bool sparse_supported = true;
+    while (offset < file_size) {
+        off_t data_offset = lseek(source_fd, offset, SEEK_DATA);
+        if (data_offset < 0) {
+            if (errno == ENXIO) {
+                progress_add_bytes(progress,
+                                   (uintmax_t)(file_size - offset));
+                offset = file_size;
+                break;
+            }
+            if (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP) {
+                sparse_supported = false;
+                break;
+            }
+            print_error(source, "cannot locate file data in");
+            return -1;
+        }
+        if (data_offset >= file_size) {
+            progress_add_bytes(progress, (uintmax_t)(file_size - offset));
+            offset = file_size;
+            break;
+        }
+
+        off_t hole_offset = lseek(source_fd, data_offset, SEEK_HOLE);
+        if (hole_offset < 0) {
+            if (errno == EINVAL || errno == ENXIO || errno == EOPNOTSUPP ||
+                errno == ENOTSUP) {
+                sparse_supported = false;
+                break;
+            }
+            print_error(source, "cannot locate file hole in");
+            return -1;
+        }
+        if (hole_offset <= data_offset) {
+            errno = EIO;
+            print_error(source, "cannot locate file hole in");
+            return -1;
+        }
+        if (hole_offset > file_size) hole_offset = file_size;
+        progress_add_bytes(progress, (uintmax_t)(data_offset - offset));
+        if (copy_range(source_fd, destination_fd, data_offset, data_offset,
+                       hole_offset - data_offset, source, destination,
+                       progress) < 0) {
+            return -1;
+        }
+        offset = hole_offset;
+    }
+
+    if (!sparse_supported &&
+        copy_range_buffered(source_fd, destination_fd, offset, offset,
+                            file_size - offset, source, destination,
+                            progress) < 0) {
+        return -1;
+    }
+    if (ftruncate(destination_fd, file_size) < 0) {
+        print_error(destination, "cannot set file size for");
         return -1;
     }
     return 0;
@@ -535,49 +691,11 @@ static int copy_regular_file_resumable(const char *source,
         }
         resume_offset = 0;
     }
-    if (lseek(source_fd, resume_offset, SEEK_SET) < 0 ||
-        lseek(partial_fd, resume_offset, SEEK_SET) < 0) {
-        print_error(partial_path, "cannot seek resume file");
-        close(partial_fd);
-        free(partial_path);
-        close(source_fd);
-        return -1;
-    }
     progress_add_bytes(progress, (uintmax_t)resume_offset);
 
-    unsigned char buffer[128 * 1024];
-    int result = 0;
-    for (;;) {
-        ssize_t count = read(source_fd, buffer, sizeof buffer);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            print_error(source, "cannot read");
-            result = -1;
-            break;
-        }
-        if (count == 0) break;
-
-        ssize_t offset = 0;
-        while (offset < count) {
-            ssize_t written = write(partial_fd, buffer + offset,
-                                    (size_t)(count - offset));
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                print_error(partial_path, "cannot write resume file");
-                result = -1;
-                break;
-            }
-            if (written == 0) {
-                errno = EIO;
-                print_error(partial_path, "cannot write resume file");
-                result = -1;
-                break;
-            }
-            offset += written;
-        }
-        if (result < 0) break;
-        progress_add_bytes(progress, (uintmax_t)count);
-    }
+    int result = copy_file_contents(source_fd, partial_fd, resume_offset,
+                                    source_stat->st_size, source, partial_path,
+                                    progress);
 
     if (result == 0 &&
         (prepare_disk_verification(source_fd, partial_fd, source,
@@ -716,41 +834,9 @@ static int copy_regular_file(const char *source, const char *destination,
         return -1;
     }
 
-    unsigned char buffer[128 * 1024];
-    uintmax_t copied = 0;
-    int result = 0;
-    for (;;) {
-        ssize_t count = read(source_fd, buffer, sizeof buffer);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            print_error(source, "cannot read");
-            result = -1;
-            break;
-        }
-        if (count == 0) break;
-
-        ssize_t offset = 0;
-        while (offset < count) {
-            ssize_t written = write(destination_fd, buffer + offset,
-                                    (size_t)(count - offset));
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                print_error(destination, "cannot write");
-                result = -1;
-                break;
-            }
-            offset += written;
-        }
-        if (result < 0) break;
-        if (progress != NULL && progress->enabled) {
-            progress_add_bytes(progress, (uintmax_t)count);
-            if (UINTMAX_MAX - copied < (uintmax_t)count) {
-                copied = UINTMAX_MAX;
-            } else {
-                copied += (uintmax_t)count;
-            }
-        }
-    }
+    int result = copy_file_contents(source_fd, destination_fd, 0,
+                                    opened_stat.st_size, source, destination,
+                                    progress);
 
     if (result == 0 && options->verify &&
         (prepare_disk_verification(source_fd, destination_fd, source,
@@ -771,10 +857,6 @@ static int copy_regular_file(const char *source, const char *destination,
         result = -1;
     }
     if (result == 0) {
-        uintmax_t expected = source_stat->st_size > 0
-                                 ? (uintmax_t)source_stat->st_size
-                                 : 0;
-        if (copied < expected) progress_add_bytes(progress, expected - copied);
         progress_mark_file(progress);
     }
     if (result == 0 && options->verbose) {

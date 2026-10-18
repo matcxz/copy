@@ -63,6 +63,44 @@ class DirectoryCopyTests(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), content)
 
+    def test_preserves_sparse_files_for_normal_and_resumed_copies(self):
+        file_size = 64 * 1024 * 1024
+        source = self.root / "sparse-source.bin"
+        with source.open("wb") as stream:
+            for offset, content in (
+                (0, b"beginning" * 128),
+                (file_size // 2, b"middle" * 128),
+                (file_size - 4096, b"ending" * 128),
+            ):
+                stream.seek(offset)
+                stream.write(content)
+            stream.truncate(file_size)
+
+        self.assertLess(source.stat().st_blocks, file_size // 512 // 4)
+
+        for mode in ("normal", "resume"):
+            with self.subTest(mode=mode):
+                destination = self.root / f"sparse-{mode}.bin"
+                arguments = ["--resume"] if mode == "resume" else []
+                result = self.run_copy(*arguments, source, destination)
+
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    msg=f"stdout={result.stdout}\nstderr={result.stderr}",
+                )
+                self.assertEqual(destination.stat().st_size, file_size)
+                self.assertLess(destination.stat().st_blocks, file_size // 512 // 4)
+                with source.open("rb") as source_stream, destination.open(
+                    "rb"
+                ) as destination_stream:
+                    while True:
+                        source_chunk = source_stream.read(1024 * 1024)
+                        destination_chunk = destination_stream.read(1024 * 1024)
+                        self.assertEqual(destination_chunk, source_chunk)
+                        if not source_chunk:
+                            break
+
 
 if __name__ == "__main__":
     unittest.main()
