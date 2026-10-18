@@ -3,6 +3,7 @@ import os
 import pathlib
 import stat
 import subprocess
+import time
 import tempfile
 import unittest
 
@@ -20,6 +21,29 @@ def resume_path(destination):
 
 
 class ResumeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.slow_write_dir = tempfile.TemporaryDirectory(
+            prefix="copy-slow-write-"
+        )
+        cls.slow_write_library = pathlib.Path(cls.slow_write_dir.name) / "slow-write.so"
+        subprocess.run(
+            [
+                "cc",
+                "-shared",
+                "-fPIC",
+                "-O2",
+                PROJECT / "tests" / "slow_write.c",
+                "-o",
+                cls.slow_write_library,
+            ],
+            check=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.slow_write_dir.cleanup()
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="copy-resume-test-")
         self.root = pathlib.Path(self.temp_dir.name)
@@ -78,6 +102,78 @@ class ResumeTests(unittest.TestCase):
         self.run_copy("--resume", self.source, self.destination)
 
         self.assertEqual(self.destination.read_bytes(), self.content)
+        self.assertFalse(partial.exists())
+
+    def test_restarts_when_source_changes_after_interruption(self):
+        partial = resume_path(self.destination)
+        partial.write_bytes(self.content[:700_000])
+        changed_content = bytearray(self.content)
+        changed_content[100] ^= 0xFF
+        self.source.write_bytes(changed_content)
+
+        self.run_copy("--resume", self.source, self.destination)
+
+        self.assertEqual(self.destination.read_bytes(), changed_content)
+        self.assertFalse(partial.exists())
+
+    def test_skips_already_complete_files_in_recursive_copy(self):
+        source_dir = self.root / "source-dir"
+        source_file = source_dir / "nested" / "payload"
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(self.content)
+
+        destination_dir = self.root / "destination-dir"
+        destination_file = destination_dir / "source-dir" / "nested" / "payload"
+        destination_file.parent.mkdir(parents=True)
+        destination_file.write_bytes(self.content)
+        original_inode = destination_file.stat().st_ino
+
+        result = self.run_copy(
+            "--recursive", "--resume", "--verbose", source_dir, destination_dir
+        )
+
+        self.assertEqual(destination_file.stat().st_ino, original_inode)
+        self.assertIn("(already complete)", result.stdout)
+
+    def test_sigkill_interruption_keeps_destination_and_resumes(self):
+        content = bytes(range(256)) * (256 * 1024)
+        self.source.write_bytes(content)
+        self.destination.write_bytes(b"previous destination")
+        partial = resume_path(self.destination)
+        environment = os.environ.copy()
+        environment["LD_PRELOAD"] = str(self.slow_write_library)
+        process = subprocess.Popen(
+            [COPY, "--resume", self.source, self.destination],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 15
+        try:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.fail("copy completed before it could be interrupted")
+                if partial.exists() and partial.stat().st_size >= 128 * 1024:
+                    break
+                time.sleep(0.005)
+            else:
+                self.fail("copy did not create a resumable partial file")
+
+            self.assertEqual(self.destination.read_bytes(), b"previous destination")
+            self.assertLess(partial.stat().st_size, len(content))
+            process.kill()
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+        self.assertEqual(self.destination.read_bytes(), b"previous destination")
+        self.assertGreater(partial.stat().st_size, 0)
+
+        self.run_copy("--resume", self.source, self.destination)
+
+        self.assertEqual(self.destination.read_bytes(), content)
         self.assertFalse(partial.exists())
 
     def test_keeps_existing_destination_if_resume_file_is_unsafe(self):

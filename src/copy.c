@@ -151,8 +151,8 @@ static ssize_t read_block_at(int fd, unsigned char *buffer, size_t capacity,
     return (ssize_t)total;
 }
 
-static int verify_contents(int source_fd, int destination_fd,
-                           const char *source, const char *destination)
+static int files_equal(int source_fd, int destination_fd,
+                       const char *source, const char *destination)
 {
     unsigned char source_buffer[128 * 1024];
     unsigned char destination_buffer[128 * 1024];
@@ -169,16 +169,26 @@ static int verify_contents(int source_fd, int destination_fd,
         if (source_count != destination_count ||
             memcmp(source_buffer, destination_buffer,
                    (size_t)source_count) != 0) {
-            fprintf(stderr, "%s: verification failed for '%s'\n",
-                    program_name, destination);
-            errno = EIO;
-            return -1;
+            return 0;
         }
         if (source_count == 0) {
-            return 0;
+            return 1;
         }
         offset += source_count;
     }
+}
+
+static int verify_contents(int source_fd, int destination_fd,
+                           const char *source, const char *destination)
+{
+    int equal = files_equal(source_fd, destination_fd, source, destination);
+    if (equal == 0) {
+        fprintf(stderr, "%s: verification failed for '%s'\n",
+                program_name, destination);
+        errno = EIO;
+        return -1;
+    }
+    return equal;
 }
 
 static void show_progress(Progress *progress)
@@ -350,6 +360,83 @@ static int copy_regular_file_resumable(const char *source,
                     program_name, destination);
             close(source_fd);
             return -1;
+        }
+        if (destination_stat.st_size == source_stat->st_size) {
+            int existing_fd = open(destination,
+                                   O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            if (existing_fd < 0) {
+                print_error(destination, "cannot open existing destination");
+                close(source_fd);
+                return -1;
+            }
+            struct stat existing_opened_stat;
+            if (fstat(existing_fd, &existing_opened_stat) < 0) {
+                print_error(destination, "cannot inspect existing destination");
+                close(existing_fd);
+                close(source_fd);
+                return -1;
+            }
+            if (!S_ISREG(existing_opened_stat.st_mode)) {
+                errno = ESTALE;
+                print_error(destination, "cannot inspect existing destination");
+                close(existing_fd);
+                close(source_fd);
+                return -1;
+            }
+            int equal = existing_opened_stat.st_size == source_stat->st_size
+                            ? files_equal(source_fd, existing_fd, source,
+                                          destination)
+                            : 0;
+            if (equal == 1) {
+                struct stat source_after;
+                if (fstat(source_fd, &source_after) < 0) {
+                    print_error(source, "cannot inspect after verification");
+                    equal = -1;
+                } else if (!same_source_version(source_stat, &source_after)) {
+                    errno = ESTALE;
+                    print_error(source, "changed during verification");
+                    equal = -1;
+                }
+            }
+            if (equal < 0) {
+                close(existing_fd);
+                close(source_fd);
+                return -1;
+            }
+            if (equal == 1) {
+                int result = 0;
+                if (options->preserve &&
+                    set_file_metadata(existing_fd, source_stat, destination,
+                                      true) < 0) {
+                    result = -1;
+                }
+                if (result == 0 && options->preserve &&
+                    fsync(existing_fd) < 0) {
+                    print_error(destination, "cannot sync preserved file");
+                    result = -1;
+                }
+                if (close(existing_fd) < 0 && result == 0) {
+                    print_error(destination, "cannot close");
+                    result = -1;
+                }
+                if (close(source_fd) < 0 && result == 0) {
+                    print_error(source, "cannot close");
+                    result = -1;
+                }
+                if (result < 0) return -1;
+                progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+                progress_mark_file(progress);
+                if (options->verbose) {
+                    printf("'%s' -> '%s' (already complete)\n",
+                           source, destination);
+                }
+                return 0;
+            }
+            if (close(existing_fd) < 0) {
+                print_error(destination, "cannot close");
+                close(source_fd);
+                return -1;
+            }
         }
     } else if (errno != ENOENT) {
         print_error(destination, "cannot inspect");

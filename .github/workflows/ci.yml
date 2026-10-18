@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build with strict warnings
+        run: make CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Werror -O2"
+
+      - name: Run tests
+        run: make test CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Werror -O2"
