@@ -13,18 +13,13 @@ regular-file copies.
 option in GNU coreutils. It is a standalone implementation and does not depend
 on `cp` to perform copies.
 
-## Recommended projects
-
-- [bat](https://github.com/sharkdp/bat) is an alternative to `cat` with
-  features such as syntax highlighting and line numbers.
-- [eza](https://github.com/eza-community/eza) is an alternative to `ls` with
-  enhanced listings, including colors, icons, and Git information.
-- [zoxide](https://github.com/ajeetdsouza/zoxide) is an alternative to `cd`
-  that learns frequently used directories and helps you navigate to them.
-
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Platform
+
+`copy` currently supports Linux only.
 
 ## Build
 
@@ -56,10 +51,14 @@ to `-r -p -n -v`, and `-rpcvg` enables recursive copying, metadata preservation,
 no-clobber, verbose output, verification, and progress. Help (`-h`) and version
 (`-V`) are standalone options. Multiple sources require an existing destination
 directory. Symbolic links are copied as links, and directories require `-r`.
-With `--resume`, interrupted regular-file copies can be continued from a hidden
-partial file next to the destination. The completed file is verified before it
-replaces the destination; mismatched partial data is discarded and recopied.
-The destination must be a regular file (not a symbolic link) when resuming.
+Sparse files are copied with their holes preserved. Recursive copies into the
+source directory itself or one of its descendants are refused. The `-c` option
+syncs the destination and advises the kernel to discard cached data for both
+files before comparing their contents. With `--resume`, interrupted regular-file
+copies can be continued from a hidden partial file next to the destination. The
+completed file is verified before it replaces the destination; mismatched
+partial data is discarded and recopied. The destination must be a regular file
+(not a symbolic link) when resuming.
 
 ## Install
 
