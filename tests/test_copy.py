@@ -46,6 +46,23 @@ class DirectoryCopyTests(unittest.TestCase):
     def test_refuses_existing_destination_that_is_source_directory(self):
         self.assert_refused_without_changes(self.root)
 
+    def test_verifies_empty_small_and_large_files(self):
+        for size in (0, 37, 256 * 1024 + 19):
+            with self.subTest(size=size):
+                source = self.root / f"verify-source-{size}.bin"
+                destination = self.root / f"verify-destination-{size}.bin"
+                content = bytes(index % 251 for index in range(size))
+                source.write_bytes(content)
+
+                result = self.run_copy("--verify", source, destination)
+
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    msg=f"stdout={result.stdout}\nstderr={result.stderr}",
+                )
+                self.assertEqual(destination.read_bytes(), content)
+
 
 if __name__ == "__main__":
     unittest.main()

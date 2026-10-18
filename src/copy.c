@@ -191,6 +191,30 @@ static int verify_contents(int source_fd, int destination_fd,
     return equal;
 }
 
+static int prepare_disk_verification(int source_fd, int destination_fd,
+                                     const char *source,
+                                     const char *destination)
+{
+    if (fsync(destination_fd) < 0) {
+        print_error(destination, "cannot sync before verification");
+        return -1;
+    }
+    int advice_result = posix_fadvise(destination_fd, 0, 0,
+                                      POSIX_FADV_DONTNEED);
+    if (advice_result != 0) {
+        errno = advice_result;
+        print_error(destination, "cannot discard cached data for");
+        return -1;
+    }
+    advice_result = posix_fadvise(source_fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (advice_result != 0) {
+        errno = advice_result;
+        print_error(source, "cannot discard cached data for");
+        return -1;
+    }
+    return 0;
+}
+
 static void show_progress(Progress *progress)
 {
     int percent;
@@ -383,10 +407,14 @@ static int copy_regular_file_resumable(const char *source,
                 close(source_fd);
                 return -1;
             }
-            int equal = existing_opened_stat.st_size == source_stat->st_size
-                            ? files_equal(source_fd, existing_fd, source,
-                                          destination)
-                            : 0;
+            int equal = 0;
+            if (existing_opened_stat.st_size == source_stat->st_size) {
+                equal = prepare_disk_verification(source_fd, existing_fd,
+                                                  source, destination) < 0
+                            ? -1
+                            : files_equal(source_fd, existing_fd, source,
+                                          destination);
+            }
             if (equal == 1) {
                 struct stat source_after;
                 if (fstat(source_fd, &source_after) < 0) {
@@ -552,7 +580,9 @@ static int copy_regular_file_resumable(const char *source,
     }
 
     if (result == 0 &&
-        verify_contents(source_fd, partial_fd, source, partial_path) < 0) {
+        (prepare_disk_verification(source_fd, partial_fd, source,
+                                   partial_path) < 0 ||
+         verify_contents(source_fd, partial_fd, source, partial_path) < 0)) {
         result = -1;
     }
     if (result == 0) {
@@ -723,7 +753,9 @@ static int copy_regular_file(const char *source, const char *destination,
     }
 
     if (result == 0 && options->verify &&
-        verify_contents(source_fd, destination_fd, source, destination) < 0) {
+        (prepare_disk_verification(source_fd, destination_fd, source,
+                                   destination) < 0 ||
+         verify_contents(source_fd, destination_fd, source, destination) < 0)) {
         result = -1;
     }
     if (result == 0 && set_file_metadata(destination_fd, source_stat,
