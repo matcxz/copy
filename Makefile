@@ -5,7 +5,7 @@ BINDIR ?= $(PREFIX)/bin
 TARGET := copy
 SOURCE := src/copy.c
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall test
 
 all: $(TARGET)
 
@@ -17,6 +17,9 @@ install: $(TARGET)
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+
+test: $(TARGET)
+	python3 -m unittest discover -s tests -v
 
 clean:
 	rm -f $(TARGET)

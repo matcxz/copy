@@ -10,14 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
-
-#ifndef O_NOFOLLOW
-#define O_NOFOLLOW 0
-#endif
 
 typedef struct {
     bool recursive;
@@ -26,6 +23,7 @@ typedef struct {
     bool verbose;
     bool verify;
     bool progress;
+    bool resume;
 } Options;
 
 typedef struct {
@@ -51,10 +49,12 @@ static void print_usage(FILE *stream)
             "  -v, --verbose        Print each copied path\n"
             "  -c, --verify         Compare copied file contents with the source\n"
             "  -g, --progress       Show overall copy progress on the terminal\n"
+            "      --resume         Resume regular-file copies; verify before publishing\n"
             "  -h, --help           Show this help\n"
             "  -V, --version        Show version information\n\n"
             "Symbolic links are copied as links. Multiple sources require an\n"
-            "existing destination directory.\n",
+            "existing destination directory. Resume data is kept in a hidden\n"
+            "file beside the destination until the copy is verified.\n",
             program_name);
 }
 
@@ -132,32 +132,40 @@ static int set_file_metadata(int fd, const struct stat *source,
     return 0;
 }
 
+static ssize_t read_block_at(int fd, unsigned char *buffer, size_t capacity,
+                             off_t offset, const char *path,
+                             const char *action)
+{
+    size_t total = 0;
+    while (total < capacity) {
+        ssize_t count = pread(fd, buffer + total, capacity - total,
+                              offset + (off_t)total);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            print_error(path, action);
+            return -1;
+        }
+        if (count == 0) break;
+        total += (size_t)count;
+    }
+    return (ssize_t)total;
+}
+
 static int verify_contents(int source_fd, int destination_fd,
                            const char *source, const char *destination)
 {
-    if (lseek(source_fd, 0, SEEK_SET) < 0 ||
-        lseek(destination_fd, 0, SEEK_SET) < 0) {
-        print_error(source, "cannot seek while verifying");
-        return -1;
-    }
-
     unsigned char source_buffer[128 * 1024];
     unsigned char destination_buffer[128 * 1024];
+    off_t offset = 0;
     for (;;) {
-        ssize_t source_count = read(source_fd, source_buffer,
-                                    sizeof source_buffer);
-        if (source_count < 0) {
-            if (errno == EINTR) continue;
-            print_error(source, "cannot read while verifying");
-            return -1;
-        }
-        ssize_t destination_count = read(destination_fd, destination_buffer,
-                                         sizeof destination_buffer);
-        if (destination_count < 0) {
-            if (errno == EINTR) continue;
-            print_error(destination, "cannot read while verifying");
-            return -1;
-        }
+        ssize_t source_count = read_block_at(source_fd, source_buffer,
+                                             sizeof source_buffer, offset,
+                                             source, "cannot read while verifying");
+        if (source_count < 0) return -1;
+        ssize_t destination_count = read_block_at(
+            destination_fd, destination_buffer, sizeof destination_buffer,
+            offset, destination, "cannot read while verifying");
+        if (destination_count < 0) return -1;
         if (source_count != destination_count ||
             memcmp(source_buffer, destination_buffer,
                    (size_t)source_count) != 0) {
@@ -169,6 +177,7 @@ static int verify_contents(int source_fd, int destination_fd,
         if (source_count == 0) {
             return 0;
         }
+        offset += source_count;
     }
 }
 
@@ -220,6 +229,315 @@ static void progress_mark_file(Progress *progress)
     }
 }
 
+static char *resume_temporary_path(const char *destination)
+{
+    char *copy = strdup(destination);
+    if (copy == NULL) return NULL;
+
+    char *slash = strrchr(copy, '/');
+    const char *parent = ".";
+    if (slash != NULL) {
+        if (slash == copy) {
+            slash[1] = '\0';
+            parent = copy;
+        } else {
+            *slash = '\0';
+            parent = copy;
+        }
+    }
+
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *byte = (const unsigned char *)destination;
+         *byte != '\0'; byte++) {
+        hash ^= *byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    char temporary_name[40];
+    snprintf(temporary_name, sizeof temporary_name,
+             ".copy-resume-%016" PRIx64, hash);
+    char *result = join_path(parent, temporary_name);
+    free(copy);
+    return result;
+}
+
+static int file_prefix_matches(int source_fd, int partial_fd, off_t length,
+                               const char *source, const char *partial_path)
+{
+    unsigned char source_buffer[128 * 1024];
+    unsigned char partial_buffer[128 * 1024];
+    off_t offset = 0;
+
+    while (offset < length) {
+        size_t requested = (uintmax_t)(length - offset) > sizeof source_buffer
+                               ? sizeof source_buffer
+                               : (size_t)(length - offset);
+        ssize_t source_count = read_block_at(source_fd, source_buffer, requested,
+                                             offset, source,
+                                             "cannot read while resuming");
+        if (source_count < 0) return -1;
+        ssize_t partial_count = read_block_at(
+            partial_fd, partial_buffer, requested, offset, partial_path,
+            "cannot read resume file");
+        if (partial_count < 0) return -1;
+        if (source_count != (ssize_t)requested ||
+            partial_count != source_count ||
+            memcmp(source_buffer, partial_buffer, (size_t)source_count) != 0) {
+            return 0;
+        }
+        offset += source_count;
+    }
+    return 1;
+}
+
+static bool same_source_version(const struct stat *before,
+                                const struct stat *after)
+{
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_size == after->st_size &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+}
+
+static int sync_parent_directory(const char *path)
+{
+    char *copy = strdup(path);
+    if (copy == NULL) return -1;
+    char *slash = strrchr(copy, '/');
+    const char *parent = ".";
+    if (slash != NULL) {
+        if (slash == copy) {
+            slash[1] = '\0';
+            parent = copy;
+        } else {
+            *slash = '\0';
+            parent = copy;
+        }
+    }
+    int directory_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    free(copy);
+    if (directory_fd < 0) return -1;
+    int result = fsync(directory_fd);
+    int saved_errno = errno;
+    if (close(directory_fd) < 0 && result == 0) {
+        return -1;
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static int copy_regular_file_resumable(const char *source,
+                                       const char *destination,
+                                       int source_fd,
+                                       const struct stat *source_stat,
+                                       const Options *options,
+                                       Progress *progress)
+{
+    struct stat destination_stat;
+    if (lstat(destination, &destination_stat) == 0) {
+        if (options->no_clobber) {
+            close(source_fd);
+            progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+            progress_mark_file(progress);
+            return 0;
+        }
+        if (S_ISLNK(destination_stat.st_mode) ||
+            !S_ISREG(destination_stat.st_mode)) {
+            fprintf(stderr,
+                    "%s: --resume requires a regular-file destination: '%s'\n",
+                    program_name, destination);
+            close(source_fd);
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        print_error(destination, "cannot inspect");
+        close(source_fd);
+        return -1;
+    }
+
+    char *partial_path = resume_temporary_path(destination);
+    if (partial_path == NULL) {
+        print_error(destination, "cannot create resume path for");
+        close(source_fd);
+        return -1;
+    }
+    int partial_fd = open(partial_path,
+                          O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (partial_fd < 0) {
+        print_error(partial_path, "cannot open resume file");
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+    struct stat partial_stat;
+    if (fstat(partial_fd, &partial_stat) < 0) {
+        print_error(partial_path, "cannot inspect resume file");
+        close(partial_fd);
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+    if (!S_ISREG(partial_stat.st_mode) || partial_stat.st_uid != geteuid() ||
+        partial_stat.st_nlink != 1) {
+        errno = EPERM;
+        print_error(partial_path, "unsafe resume file");
+        close(partial_fd);
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+    if (flock(partial_fd, LOCK_EX | LOCK_NB) < 0) {
+        print_error(partial_path, "resume file is already in use");
+        close(partial_fd);
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+
+    off_t resume_offset = partial_stat.st_size;
+    int prefix_matches = 0;
+    if (source_stat->st_size >= 0 && resume_offset >= 0 &&
+        resume_offset <= source_stat->st_size) {
+        prefix_matches = file_prefix_matches(source_fd, partial_fd,
+                                              resume_offset, source,
+                                              partial_path);
+    }
+    if (prefix_matches < 0) {
+        close(partial_fd);
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+    if (prefix_matches == 0) {
+        if (ftruncate(partial_fd, 0) < 0) {
+            print_error(partial_path, "cannot restart resume file");
+            close(partial_fd);
+            free(partial_path);
+            close(source_fd);
+            return -1;
+        }
+        resume_offset = 0;
+    }
+    if (lseek(source_fd, resume_offset, SEEK_SET) < 0 ||
+        lseek(partial_fd, resume_offset, SEEK_SET) < 0) {
+        print_error(partial_path, "cannot seek resume file");
+        close(partial_fd);
+        free(partial_path);
+        close(source_fd);
+        return -1;
+    }
+    progress_add_bytes(progress, (uintmax_t)resume_offset);
+
+    unsigned char buffer[128 * 1024];
+    int result = 0;
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof buffer);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            print_error(source, "cannot read");
+            result = -1;
+            break;
+        }
+        if (count == 0) break;
+
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(partial_fd, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                print_error(partial_path, "cannot write resume file");
+                result = -1;
+                break;
+            }
+            if (written == 0) {
+                errno = EIO;
+                print_error(partial_path, "cannot write resume file");
+                result = -1;
+                break;
+            }
+            offset += written;
+        }
+        if (result < 0) break;
+        progress_add_bytes(progress, (uintmax_t)count);
+    }
+
+    if (result == 0 &&
+        verify_contents(source_fd, partial_fd, source, partial_path) < 0) {
+        result = -1;
+    }
+    if (result == 0) {
+        struct stat source_after;
+        if (fstat(source_fd, &source_after) < 0) {
+            print_error(source, "cannot inspect after copy");
+            result = -1;
+        } else if (!same_source_version(source_stat, &source_after)) {
+            errno = ESTALE;
+            print_error(source, "changed during copy");
+            result = -1;
+        }
+    }
+    if (result == 0 && options->preserve &&
+        set_file_metadata(partial_fd, source_stat, partial_path, true) < 0) {
+        result = -1;
+    }
+    if (result == 0 && !options->preserve) {
+        mode_t mask = umask(0);
+        umask(mask);
+        if (fchmod(partial_fd, 0666 & ~mask) < 0) {
+            print_error(partial_path, "cannot set permissions for");
+            result = -1;
+        }
+    }
+    if (result == 0 && fsync(partial_fd) < 0) {
+        print_error(partial_path, "cannot sync resume file");
+        result = -1;
+    }
+    if (close(source_fd) < 0 && result == 0) {
+        print_error(source, "cannot close");
+        result = -1;
+    }
+    bool published = false;
+    if (result == 0) {
+        int publish_result;
+        if (options->no_clobber) {
+            publish_result = link(partial_path, destination);
+            if (publish_result == 0) {
+                published = true;
+                if (unlink(partial_path) < 0) {
+                    print_error(partial_path, "cannot remove published resume file");
+                    publish_result = -1;
+                }
+            }
+        } else {
+            publish_result = rename(partial_path, destination);
+            published = publish_result == 0;
+        }
+        if (publish_result < 0) {
+            print_error(destination, "cannot publish completed copy to");
+            result = -1;
+        } else if (sync_parent_directory(destination) < 0) {
+            print_error(destination, "cannot sync destination directory for");
+            result = -1;
+        }
+    }
+    if (close(partial_fd) < 0 && result == 0) {
+        print_error(partial_path, "cannot close resume file");
+        result = -1;
+    }
+    if (result == 0) {
+        progress_mark_file(progress);
+        if (options->verbose) printf("'%s' -> '%s'\n", source, destination);
+    } else if (!published) {
+        fprintf(stderr, "%s: partial data kept for resuming from '%s'\n",
+                program_name, partial_path);
+    }
+    free(partial_path);
+    return result;
+}
+
 static int copy_regular_file(const char *source, const char *destination,
                              const struct stat *source_stat,
                              const Options *options, Progress *progress)
@@ -255,6 +573,11 @@ static int copy_regular_file(const char *source, const char *destination,
         print_error(destination, "cannot inspect");
         close(source_fd);
         return -1;
+    }
+
+    if (options->resume) {
+        return copy_regular_file_resumable(source, destination, source_fd,
+                                           &opened_stat, options, progress);
     }
 
     int flags = (options->verify ? O_RDWR : O_WRONLY) | O_CREAT | O_CLOEXEC;
@@ -812,6 +1135,8 @@ int main(int argc, char **argv)
             } else if (strcmp(arg, "-g") == 0 ||
                        strcmp(arg, "--progress") == 0) {
                 options.progress = true;
+            } else if (strcmp(arg, "--resume") == 0) {
+                options.resume = true;
             } else if (strcmp(arg, "-h") == 0 ||
                        strcmp(arg, "--help") == 0) {
                 print_usage(stdout);

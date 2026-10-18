@@ -1,3 +1,5 @@
 /copy
 /core
 /core.*
+__pycache__/
+*.py[cod]
