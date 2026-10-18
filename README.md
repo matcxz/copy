@@ -6,6 +6,26 @@
 preservation, no-clobber mode, aggregate progress, and resumable, verified
 regular-file copies.
 
+## Project goals
+
+`copy` aims to be an independent and separately distributed alternative to
+`cp`, focused on a small set of useful features rather than reproducing every
+option in GNU coreutils. It is a standalone implementation and does not depend
+on `cp` to perform copies.
+
+## Recommended projects
+
+- [bat](https://github.com/sharkdp/bat) is an alternative to `cat` with
+  features such as syntax highlighting and line numbers.
+- [eza](https://github.com/eza-community/eza) is an alternative to `ls` with
+  enhanced listings, including colors, icons, and Git information.
+- [zoxide](https://github.com/ajeetdsouza/zoxide) is an alternative to `cd`
+  that learns frequently used directories and helps you navigate to them.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
 ## Build
 
 ```sh
