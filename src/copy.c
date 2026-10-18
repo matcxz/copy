@@ -835,6 +835,91 @@ static int copy_symlink(const char *source, const char *destination,
 static int copy_entry(const char *source, const char *destination,
                       const Options *options, Progress *progress);
 
+static int check_directory_destination(const char *source,
+                                       const char *destination,
+                                       const struct stat *source_stat)
+{
+    char *candidate = strdup(destination);
+    if (candidate == NULL) {
+        print_error(destination, "cannot allocate path for");
+        return -1;
+    }
+
+    int directory_fd = -1;
+    for (;;) {
+        directory_fd = open(candidate, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (directory_fd >= 0) break;
+        if (errno != ENOENT) {
+            print_error(candidate, "cannot inspect destination ancestor");
+            free(candidate);
+            return -1;
+        }
+
+        size_t length = strlen(candidate);
+        while (length > 1 && candidate[length - 1] == '/') {
+            candidate[--length] = '\0';
+        }
+        char *slash = strrchr(candidate, '/');
+        if (slash == NULL) {
+            strcpy(candidate, ".");
+        } else if (slash == candidate) {
+            slash[1] = '\0';
+        } else {
+            *slash = '\0';
+        }
+        if (strcmp(candidate, ".") == 0) {
+            directory_fd = open(candidate, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (directory_fd < 0) {
+                print_error(candidate, "cannot inspect destination ancestor");
+                free(candidate);
+                return -1;
+            }
+            break;
+        }
+    }
+    free(candidate);
+
+    for (;;) {
+        struct stat current_stat;
+        if (fstat(directory_fd, &current_stat) < 0) {
+            print_error(destination, "cannot inspect destination ancestor");
+            close(directory_fd);
+            return -1;
+        }
+        if (current_stat.st_dev == source_stat->st_dev &&
+            current_stat.st_ino == source_stat->st_ino) {
+            fprintf(stderr,
+                    "%s: cannot copy directory '%s' into itself ('%s')\n",
+                    program_name, source, destination);
+            close(directory_fd);
+            return -1;
+        }
+
+        int parent_fd = openat(directory_fd, "..",
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (parent_fd < 0) {
+            print_error(destination, "cannot inspect destination ancestor");
+            close(directory_fd);
+            return -1;
+        }
+        struct stat parent_stat;
+        if (fstat(parent_fd, &parent_stat) < 0) {
+            print_error(destination, "cannot inspect destination ancestor");
+            close(parent_fd);
+            close(directory_fd);
+            return -1;
+        }
+        if (parent_stat.st_dev == current_stat.st_dev &&
+            parent_stat.st_ino == current_stat.st_ino) {
+            close(parent_fd);
+            close(directory_fd);
+            return 0;
+        }
+        close(directory_fd);
+        directory_fd = parent_fd;
+    }
+}
+
 static int copy_directory(const char *source, const char *destination,
                           const struct stat *source_stat,
                           const Options *options, Progress *progress)
@@ -854,6 +939,9 @@ static int copy_directory(const char *source, const char *destination,
     }
     if (!destination_exists && errno != ENOENT) {
         print_error(destination, "cannot inspect");
+        return -1;
+    }
+    if (check_directory_destination(source, destination, source_stat) < 0) {
         return -1;
     }
 
@@ -1023,46 +1111,6 @@ static int scan_progress_tree(const char *path, bool recursive,
     return result;
 }
 
-static bool path_is_within(const char *parent, const char *child)
-{
-    size_t length = strlen(parent);
-    while (length > 1 && parent[length - 1] == '/') length--;
-    if (length == 1 && parent[0] == '/') {
-        return child[0] == '/';
-    }
-    return strncmp(parent, child, length) == 0 &&
-           (child[length] == '/' || child[length] == '\0');
-}
-
-static char *canonical_destination(const char *path)
-{
-    char *copy = strdup(path);
-    if (copy == NULL) return NULL;
-
-    char *slash = strrchr(copy, '/');
-    const char *parent_path = ".";
-    char *base = copy;
-    if (slash != NULL) {
-        *slash = '\0';
-        parent_path = copy[0] == '\0' ? "/" : copy;
-        base = slash + 1;
-    }
-    if (*base == '\0') {
-        free(copy);
-        return realpath(path, NULL);
-    }
-
-    char *canonical_parent = realpath(parent_path, NULL);
-    if (canonical_parent == NULL) {
-        free(copy);
-        return NULL;
-    }
-    char *canonical = join_path(canonical_parent, base);
-    free(canonical_parent);
-    free(copy);
-    return canonical;
-}
-
 static int main_copy(int argc, char **argv, const Options *options)
 {
     int operand_count = argc;
@@ -1104,25 +1152,6 @@ static int main_copy(int argc, char **argv, const Options *options)
             print_error(destination, "cannot allocate destination path for");
             failures++;
             continue;
-        }
-
-        struct stat source_stat;
-        if (lstat(source, &source_stat) == 0 && S_ISDIR(source_stat.st_mode)) {
-            char *canonical_source = realpath(source, NULL);
-            char *canonical_target = canonical_destination(target);
-            if (canonical_source != NULL && canonical_target != NULL &&
-                path_is_within(canonical_source, canonical_target)) {
-                fprintf(stderr,
-                        "%s: cannot copy directory '%s' into itself ('%s')\n",
-                        program_name, source, target);
-                failures++;
-                free(canonical_source);
-                free(canonical_target);
-                free(target);
-                continue;
-            }
-            free(canonical_source);
-            free(canonical_target);
         }
 
         Progress progress = {
