@@ -28,6 +28,15 @@ typedef struct {
     bool progress;
 } Options;
 
+typedef struct {
+    bool enabled;
+    uintmax_t total_bytes;
+    uintmax_t processed_bytes;
+    size_t total_files;
+    size_t processed_files;
+    int last_percent;
+} Progress;
+
 static const char *program_name = "copy";
 
 static void print_usage(FILE *stream)
@@ -41,7 +50,7 @@ static void print_usage(FILE *stream)
             "  -n, --no-clobber     Never overwrite an existing destination\n"
             "  -v, --verbose        Print each copied path\n"
             "  -c, --verify         Compare copied file contents with the source\n"
-            "  -g, --progress       Show per-file copy progress on the terminal\n"
+            "  -g, --progress       Show overall copy progress on the terminal\n"
             "  -h, --help           Show this help\n"
             "  -V, --version        Show version information\n\n"
             "Symbolic links are copied as links. Multiple sources require an\n"
@@ -163,23 +172,57 @@ static int verify_contents(int source_fd, int destination_fd,
     }
 }
 
-static void show_progress(const char *path, off_t copied, off_t total)
+static void show_progress(Progress *progress)
 {
-    if (total > 0) {
-        int percent = (int)(((long double)copied * 100.0L) / total);
-        if (percent > 100) percent = 100;
-        fprintf(stderr, "\r%s: %d%% (%" PRIuMAX "/%" PRIuMAX " bytes)",
-                path, percent, (uintmax_t)copied, (uintmax_t)total);
+    int percent;
+    if (progress->total_bytes > 0) {
+        long double ratio = ((long double)progress->processed_bytes * 100.0L) /
+                            progress->total_bytes;
+        percent = ratio >= 100.0L ? 100 : (int)ratio;
     } else {
-        fprintf(stderr, "\r%s: %" PRIuMAX " bytes", path,
-                (uintmax_t)copied);
+        long double ratio = progress->total_files > 0
+                                ? ((long double)progress->processed_files * 100.0L) /
+                                      progress->total_files
+                                : 100.0L;
+        percent = ratio >= 100.0L ? 100 : (int)ratio;
+    }
+    if (percent == progress->last_percent) return;
+    progress->last_percent = percent;
+    if (progress->total_bytes > 0) {
+        fprintf(stderr, "\rOverall: %d%% (%" PRIuMAX "/%" PRIuMAX " bytes)",
+                percent, progress->processed_bytes, progress->total_bytes);
+    } else {
+        fprintf(stderr, "\rOverall: %d%% (%zu/%zu files)",
+                percent, progress->processed_files, progress->total_files);
     }
     fflush(stderr);
 }
 
+static void progress_add_bytes(Progress *progress, uintmax_t amount)
+{
+    if (progress == NULL || !progress->enabled) return;
+    if (amount >= progress->total_bytes - progress->processed_bytes) {
+        progress->processed_bytes = progress->total_bytes;
+    } else {
+        progress->processed_bytes += amount;
+    }
+    show_progress(progress);
+}
+
+static void progress_mark_file(Progress *progress)
+{
+    if (progress == NULL || !progress->enabled) return;
+    if (progress->processed_files < progress->total_files) {
+        progress->processed_files++;
+    }
+    if (progress->total_bytes == 0) {
+        show_progress(progress);
+    }
+}
+
 static int copy_regular_file(const char *source, const char *destination,
                              const struct stat *source_stat,
-                             const Options *options)
+                             const Options *options, Progress *progress)
 {
     int source_fd = open(source, O_RDONLY | O_NOFOLLOW);
     if (source_fd < 0) {
@@ -224,6 +267,8 @@ static int copy_regular_file(const char *source, const char *destination,
     if (destination_fd < 0) {
         if (options->no_clobber && errno == EEXIST) {
             close(source_fd);
+            progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+            progress_mark_file(progress);
             return 0;
         }
         print_error(destination, "cannot create");
@@ -232,7 +277,7 @@ static int copy_regular_file(const char *source, const char *destination,
     }
 
     unsigned char buffer[128 * 1024];
-    off_t copied = 0;
+    uintmax_t copied = 0;
     int result = 0;
     for (;;) {
         ssize_t count = read(source_fd, buffer, sizeof buffer);
@@ -257,9 +302,13 @@ static int copy_regular_file(const char *source, const char *destination,
             offset += written;
         }
         if (result < 0) break;
-        copied += count;
-        if (options->progress && isatty(STDERR_FILENO)) {
-            show_progress(destination, copied, source_stat->st_size);
+        if (progress != NULL && progress->enabled) {
+            progress_add_bytes(progress, (uintmax_t)count);
+            if (UINTMAX_MAX - copied < (uintmax_t)count) {
+                copied = UINTMAX_MAX;
+            } else {
+                copied += (uintmax_t)count;
+            }
         }
     }
 
@@ -279,8 +328,12 @@ static int copy_regular_file(const char *source, const char *destination,
         print_error(source, "cannot close");
         result = -1;
     }
-    if (options->progress && isatty(STDERR_FILENO)) {
-        fputc('\n', stderr);
+    if (result == 0) {
+        uintmax_t expected = source_stat->st_size > 0
+                                 ? (uintmax_t)source_stat->st_size
+                                 : 0;
+        if (copied < expected) progress_add_bytes(progress, expected - copied);
+        progress_mark_file(progress);
     }
     if (result == 0 && options->verbose) {
         printf("'%s' -> '%s'\n", source, destination);
@@ -289,7 +342,8 @@ static int copy_regular_file(const char *source, const char *destination,
 }
 
 static int copy_symlink(const char *source, const char *destination,
-                        const struct stat *source_stat, const Options *options)
+                        const struct stat *source_stat, const Options *options,
+                        Progress *progress)
 {
     size_t capacity = source_stat->st_size > 0
                           ? (size_t)source_stat->st_size + 1
@@ -325,6 +379,8 @@ static int copy_symlink(const char *source, const char *destination,
     if (lstat(destination, &existing) == 0) {
         if (options->no_clobber) {
             free(target);
+            progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+            progress_mark_file(progress);
             return 0;
         }
         if (S_ISDIR(existing.st_mode) && !S_ISLNK(existing.st_mode)) {
@@ -361,15 +417,17 @@ static int copy_symlink(const char *source, const char *destination,
     if (options->verbose) {
         printf("'%s' -> '%s' (symbolic link)\n", source, destination);
     }
+    progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+    progress_mark_file(progress);
     return 0;
 }
 
 static int copy_entry(const char *source, const char *destination,
-                      const Options *options);
+                      const Options *options, Progress *progress);
 
 static int copy_directory(const char *source, const char *destination,
                           const struct stat *source_stat,
-                          const Options *options)
+                          const Options *options, Progress *progress)
 {
     if (!options->recursive) {
         fprintf(stderr, "%s: omitting directory '%s' (use --recursive)\n",
@@ -425,7 +483,7 @@ static int copy_directory(const char *source, const char *destination,
             result = -1;
             continue;
         }
-        if (copy_entry(source_child, destination_child, options) < 0) {
+        if (copy_entry(source_child, destination_child, options, progress) < 0) {
             result = -1;
         }
         free(source_child);
@@ -456,7 +514,7 @@ static int copy_directory(const char *source, const char *destination,
 }
 
 static int copy_entry(const char *source, const char *destination,
-                      const Options *options)
+                      const Options *options, Progress *progress)
 {
     struct stat source_stat;
     if (lstat(source, &source_stat) < 0) {
@@ -465,17 +523,94 @@ static int copy_entry(const char *source, const char *destination,
     }
 
     if (S_ISLNK(source_stat.st_mode)) {
-        return copy_symlink(source, destination, &source_stat, options);
+        return copy_symlink(source, destination, &source_stat, options,
+                            progress);
     }
     if (S_ISDIR(source_stat.st_mode)) {
-        return copy_directory(source, destination, &source_stat, options);
+        return copy_directory(source, destination, &source_stat, options,
+                              progress);
     }
     if (S_ISREG(source_stat.st_mode)) {
-        return copy_regular_file(source, destination, &source_stat, options);
+        return copy_regular_file(source, destination, &source_stat, options,
+                                 progress);
     }
 
     fprintf(stderr, "%s: unsupported file type: '%s'\n", program_name, source);
     return -1;
+}
+
+static int add_progress_file(Progress *progress, const struct stat *file_stat,
+                             const char *path)
+{
+    if (file_stat->st_size < 0) {
+        errno = EOVERFLOW;
+        print_error(path, "cannot determine size of");
+        return -1;
+    }
+    uintmax_t size = (uintmax_t)file_stat->st_size;
+    if (UINTMAX_MAX - progress->total_bytes < size ||
+        progress->total_files == SIZE_MAX) {
+        errno = EOVERFLOW;
+        print_error(path, "too many bytes or files to track for");
+        return -1;
+    }
+    progress->total_bytes += size;
+    progress->total_files++;
+    return 0;
+}
+
+static int scan_progress_tree(const char *path, bool recursive,
+                              Progress *progress)
+{
+    struct stat file_stat;
+    if (lstat(path, &file_stat) < 0) {
+        print_error(path, "cannot access while calculating progress for");
+        return -1;
+    }
+    if (S_ISREG(file_stat.st_mode) || S_ISLNK(file_stat.st_mode)) {
+        return add_progress_file(progress, &file_stat, path);
+    }
+    if (!S_ISDIR(file_stat.st_mode) || !recursive) {
+        return 0;
+    }
+
+    DIR *directory = opendir(path);
+    if (directory == NULL) {
+        print_error(path, "cannot open while calculating progress for");
+        return -1;
+    }
+
+    int result = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(directory);
+        if (entry == NULL) {
+            if (errno != 0) {
+                print_error(path, "cannot read while calculating progress for");
+                result = -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char *child = join_path(path, entry->d_name);
+        if (child == NULL) {
+            print_error(path, "cannot allocate progress path for");
+            result = -1;
+            continue;
+        }
+        if (scan_progress_tree(child, recursive, progress) < 0) {
+            result = -1;
+        }
+        free(child);
+    }
+    if (closedir(directory) < 0) {
+        print_error(path, "cannot close while calculating progress for");
+        result = -1;
+    }
+    return result;
 }
 
 static bool path_is_within(const char *parent, const char *child)
@@ -580,9 +715,21 @@ static int main_copy(int argc, char **argv, const Options *options)
             free(canonical_target);
         }
 
-        if (copy_entry(source, target, options) < 0) {
+        Progress progress = {
+            .enabled = options->progress && isatty(STDERR_FILENO),
+            .last_percent = -1
+        };
+        if (progress.enabled &&
+            scan_progress_tree(source, options->recursive, &progress) < 0) {
+            failures++;
+            free(target);
+            continue;
+        }
+        if (copy_entry(source, target, options,
+                       progress.enabled ? &progress : NULL) < 0) {
             failures++;
         }
+        if (progress.last_percent >= 0) fputc('\n', stderr);
         free(target);
     }
     return failures == 0 ? 0 : 1;
