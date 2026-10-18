@@ -1,5 +1,6 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
+CFLAGS ?= -O2
+WARNFLAGS := -std=c11 -Wall -Wextra -Wpedantic
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 TARGET := copy
@@ -10,7 +11,7 @@ SOURCE := src/copy.c
 all: $(TARGET)
 
 $(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) $(SOURCE) -o $@
+	$(CC) $(WARNFLAGS) $(CFLAGS) $(SOURCE) -o $@
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
@@ -22,7 +23,7 @@ test: $(TARGET)
 	COPY_BIN="$(CURDIR)/$(TARGET)" python3 -m unittest discover -s tests -v
 
 $(TARGET)-asan: $(SOURCE)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all \
+	$(CC) $(WARNFLAGS) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all \
 		-g -O1 $(SOURCE) -o $@
 
 check: $(TARGET)-asan
