@@ -209,6 +209,61 @@ class DirectoryCopyTests(unittest.TestCase):
         self.assertEqual(copied_dir.stat().st_mode & 0o777, 0o700)
         self.assertEqual((copied_dir / "private").stat().st_mode & 0o777, 0o600)
 
+    def test_copies_regular_file_to_dev_null(self):
+        source = self.root / "null-source"
+        source.write_bytes(b"discarded output")
+
+        result = self.run_copy(source, "/dev/null")
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_copies_regular_file_to_stdout_device(self):
+        source = self.root / "stdout-source"
+        content = b"written to standard output"
+        source.write_bytes(content)
+
+        result = subprocess.run(
+            [COPY, source, "/dev/stdout"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr.decode())
+        self.assertEqual(result.stdout, content)
+
+    def test_copies_regular_file_to_fifo(self):
+        source = self.root / "fifo-source"
+        content = b"written through fifo"
+        source.write_bytes(content)
+        destination = self.root / "destination-fifo"
+        os.mkfifo(destination)
+        reader_fd = os.open(destination, os.O_RDONLY | os.O_NONBLOCK)
+        result = self.run_copy(source, destination)
+        received = os.read(reader_fd, 4096)
+        os.close(reader_fd)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(received, content)
+
+    def test_verify_refuses_nonregular_destination(self):
+        source = self.root / "verify-special-source"
+        source.write_bytes(b"content")
+
+        result = self.run_copy("--verify", source, "/dev/null")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--verify requires a regular-file destination", result.stderr)
+
+    def test_resume_refuses_nonregular_destination(self):
+        source = self.root / "resume-special-source"
+        source.write_bytes(b"content")
+
+        result = self.run_copy("--resume", source, "/dev/null")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--resume requires a regular-file destination", result.stderr)
+
     def test_dry_run_file_copy_does_not_create_or_modify_destination(self):
         destination = self.root / "planned-copy.txt"
         result = self.run_copy("--dry-run", self.source / "keep.txt", destination)

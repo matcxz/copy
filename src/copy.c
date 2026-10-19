@@ -786,6 +786,40 @@ static int copy_regular_file_resumable(const char *source,
     return result;
 }
 
+static int copy_stream_contents(int source_fd, int destination_fd,
+                                const char *source, const char *destination,
+                                Progress *progress)
+{
+    unsigned char buffer[128 * 1024];
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof buffer);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            print_error(source, "cannot read");
+            return -1;
+        }
+        if (count == 0) return 0;
+
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0) {
+                if (errno == EINTR) continue;
+                print_error(destination, "cannot write");
+                return -1;
+            }
+            if (written == 0) {
+                errno = EIO;
+                print_error(destination, "cannot write");
+                return -1;
+            }
+            offset += written;
+        }
+        progress_add_bytes(progress, (uintmax_t)count);
+    }
+}
+
 static int copy_regular_file(const char *source, const char *destination,
                              const struct stat *source_stat,
                              const Options *options, Progress *progress)
@@ -862,6 +896,13 @@ static int copy_regular_file(const char *source, const char *destination,
             close(source_fd);
             return -1;
         }
+        if (options->verify && !S_ISREG(destination_stat.st_mode)) {
+            fprintf(stderr,
+                    "%s: --verify requires a regular-file destination: '%s'\n",
+                    program_name, destination);
+            close(source_fd);
+            return -1;
+        }
     } else if (errno != ENOENT) {
         print_error(destination, "cannot inspect");
         close(source_fd);
@@ -892,9 +933,28 @@ static int copy_regular_file(const char *source, const char *destination,
         return -1;
     }
 
-    int result = copy_file_contents(source_fd, destination_fd, 0,
-                                    opened_stat.st_size, source, destination,
-                                    progress);
+    struct stat destination_opened_stat;
+    if (fstat(destination_fd, &destination_opened_stat) < 0) {
+        print_error(destination, "cannot inspect");
+        close(destination_fd);
+        close(source_fd);
+        return -1;
+    }
+    if (options->verify && !S_ISREG(destination_opened_stat.st_mode)) {
+        fprintf(stderr,
+                "%s: --verify requires a regular-file destination: '%s'\n",
+                program_name, destination);
+        close(destination_fd);
+        close(source_fd);
+        return -1;
+    }
+
+    int result = S_ISREG(destination_opened_stat.st_mode)
+                     ? copy_file_contents(source_fd, destination_fd, 0,
+                                          opened_stat.st_size, source,
+                                          destination, progress)
+                     : copy_stream_contents(source_fd, destination_fd, source,
+                                            destination, progress);
 
     if (result == 0 && options->verify &&
         (prepare_disk_verification(source_fd, destination_fd, source,
@@ -902,8 +962,9 @@ static int copy_regular_file(const char *source, const char *destination,
          verify_contents(source_fd, destination_fd, source, destination) < 0)) {
         result = -1;
     }
-    if (result == 0 && set_file_metadata(destination_fd, source_stat,
-                                         destination, options->preserve) < 0) {
+    if (result == 0 && S_ISREG(destination_opened_stat.st_mode) &&
+        set_file_metadata(destination_fd, source_stat, destination,
+                          options->preserve) < 0) {
         result = -1;
     }
     if (close(destination_fd) < 0 && result == 0) {
