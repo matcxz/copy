@@ -26,6 +26,7 @@ typedef struct {
     bool verify;
     bool progress;
     bool resume;
+    bool dry_run;
 } Options;
 
 typedef struct {
@@ -52,6 +53,7 @@ static void print_usage(FILE *stream)
             "  -c, --verify         Compare copied file contents with the source\n"
             "  -g, --progress       Show overall copy progress on the terminal\n"
             "      --resume         Resume regular-file copies; verify before publishing\n"
+            "      --dry-run        Show planned changes without copying anything\n"
             "  -h, --help           Show this help\n"
             "  -V, --version        Show version information\n\n"
             "Symbolic links are copied as links. Multiple sources require an\n"
@@ -64,6 +66,16 @@ static void print_error(const char *path, const char *action)
 {
     fprintf(stderr, "%s: %s '%s': %s\n", program_name, action, path,
             strerror(errno));
+}
+
+static void print_dry_run(const char *action, const char *source,
+                          const char *destination)
+{
+    if (destination == NULL) {
+        printf("Would %s '%s'\n", action, source);
+    } else {
+        printf("Would %s '%s' -> '%s'\n", action, source, destination);
+    }
 }
 
 static char *join_path(const char *left, const char *right)
@@ -777,6 +789,51 @@ static int copy_regular_file(const char *source, const char *destination,
                              const struct stat *source_stat,
                              const Options *options, Progress *progress)
 {
+    if (options->dry_run) {
+        struct stat destination_lstat;
+        bool destination_exists = lstat(destination, &destination_lstat) == 0;
+        if (!destination_exists && errno != ENOENT) {
+            print_error(destination, "cannot inspect");
+            return -1;
+        }
+        struct stat destination_stat;
+        bool destination_is_directory = false;
+        if (stat(destination, &destination_stat) == 0) {
+            if (same_file(source_stat, &destination_stat)) {
+                fprintf(stderr, "%s: '%s' and '%s' are the same file\n",
+                        program_name, source, destination);
+                return -1;
+            }
+            destination_is_directory = S_ISDIR(destination_stat.st_mode);
+        } else if (errno != ENOENT) {
+            print_error(destination, "cannot inspect");
+            return -1;
+        }
+        if (options->no_clobber && destination_exists) {
+            print_dry_run("skip existing destination", destination, NULL);
+            progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+            progress_mark_file(progress);
+            return 0;
+        }
+        if (destination_is_directory) {
+            fprintf(stderr, "%s: cannot overwrite directory '%s' with a file\n",
+                    program_name, destination);
+            return -1;
+        }
+        if (options->resume && destination_exists &&
+            (S_ISLNK(destination_lstat.st_mode) ||
+             !S_ISREG(destination_lstat.st_mode))) {
+            fprintf(stderr,
+                    "%s: --resume requires a regular-file destination: '%s'\n",
+                    program_name, destination);
+            return -1;
+        }
+        print_dry_run("copy", source, destination);
+        progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+        progress_mark_file(progress);
+        return 0;
+    }
+
     int source_fd = open(source, O_RDONLY | O_NOFOLLOW);
     if (source_fd < 0) {
         print_error(source, "cannot open");
@@ -869,6 +926,31 @@ static int copy_symlink(const char *source, const char *destination,
                         const struct stat *source_stat, const Options *options,
                         Progress *progress)
 {
+    if (options->dry_run) {
+        struct stat existing;
+        if (lstat(destination, &existing) == 0) {
+            if (options->no_clobber) {
+                print_dry_run("skip existing destination", destination, NULL);
+                progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+                progress_mark_file(progress);
+                return 0;
+            }
+            if (S_ISDIR(existing.st_mode) && !S_ISLNK(existing.st_mode)) {
+                fprintf(stderr,
+                        "%s: refusing to replace directory '%s' with a link\n",
+                        program_name, destination);
+                return -1;
+            }
+        } else if (errno != ENOENT) {
+            print_error(destination, "cannot inspect");
+            return -1;
+        }
+        print_dry_run("copy symbolic link", source, destination);
+        progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
+        progress_mark_file(progress);
+        return 0;
+    }
+
     size_t capacity = source_stat->st_size > 0
                           ? (size_t)source_stat->st_size + 1
                           : 256;
@@ -1059,7 +1141,12 @@ static int copy_directory(const char *source, const char *destination,
         return -1;
     }
 
-    if (!destination_exists && mkdir(destination, 0777) < 0) {
+    if (options->dry_run) {
+        print_dry_run(destination_exists ? "merge directory" : "create directory",
+                      source, destination);
+    }
+    if (!destination_exists && !options->dry_run &&
+        mkdir(destination, 0777) < 0) {
         print_error(destination, "cannot create directory");
         return -1;
     }
@@ -1106,7 +1193,7 @@ static int copy_directory(const char *source, const char *destination,
         result = -1;
     }
 
-    if (options->preserve) {
+    if (options->preserve && !options->dry_run) {
         if (chmod(destination, source_stat->st_mode & 07777) < 0) {
             print_error(destination, "cannot preserve permissions for");
             result = -1;
@@ -1119,7 +1206,7 @@ static int copy_directory(const char *source, const char *destination,
             }
         }
     }
-    if (result == 0 && options->verbose) {
+    if (result == 0 && options->verbose && !options->dry_run) {
         printf("'%s' -> '%s'\n", source, destination);
     }
     return result;
@@ -1269,7 +1356,8 @@ static int main_copy(int argc, char **argv, const Options *options)
         }
 
         Progress progress = {
-            .enabled = options->progress && isatty(STDERR_FILENO),
+            .enabled = options->progress && !options->dry_run &&
+                       isatty(STDERR_FILENO),
             .last_percent = -1
         };
         if (progress.enabled &&
@@ -1367,6 +1455,8 @@ int main(int argc, char **argv)
                 options.progress = true;
             } else if (strcmp(arg, "--resume") == 0) {
                 options.resume = true;
+            } else if (strcmp(arg, "--dry-run") == 0) {
+                options.dry_run = true;
             } else if (strcmp(arg, "-h") == 0 ||
                        strcmp(arg, "--help") == 0) {
                 print_usage(stdout);

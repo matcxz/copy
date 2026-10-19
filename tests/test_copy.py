@@ -47,6 +47,81 @@ class DirectoryCopyTests(unittest.TestCase):
     def test_refuses_existing_destination_that_is_source_directory(self):
         self.assert_refused_without_changes(self.root)
 
+    def test_dry_run_file_copy_does_not_create_or_modify_destination(self):
+        destination = self.root / "planned-copy.txt"
+        result = self.run_copy("--dry-run", self.source / "keep.txt", destination)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Would copy", result.stdout)
+        self.assertFalse(destination.exists())
+
+    def test_dry_run_recursive_copy_lists_files_and_links_without_changes(self):
+        nested = self.source / "nested"
+        nested.mkdir()
+        (nested / "payload.txt").write_text("nested content")
+        (self.source / "link").symlink_to("keep.txt")
+        destination = self.root / "planned-tree"
+
+        result = self.run_copy("--dry-run", "--recursive", self.source, destination)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Would create directory", result.stdout)
+        self.assertIn(str(destination / "nested" / "payload.txt"), result.stdout)
+        self.assertIn("Would copy symbolic link", result.stdout)
+        self.assertFalse(destination.exists())
+        self.assertEqual((self.source / "keep.txt").read_text(), "existing content")
+
+    def test_dry_run_no_clobber_reports_existing_files_and_keeps_them(self):
+        destination_dir = self.root / "existing-destination"
+        destination_dir.mkdir()
+        destination_file = destination_dir / "d"
+        destination_file.mkdir()
+        existing_file = destination_file / "keep.txt"
+        existing_file.write_text("do not replace")
+
+        result = self.run_copy(
+            "--dry-run", "--no-clobber", "--recursive",
+            self.source, destination_dir
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Would skip existing destination", result.stdout)
+        self.assertEqual(existing_file.read_text(), "do not replace")
+
+    def test_dry_run_no_clobber_skips_existing_directory_destination(self):
+        destination = self.root / "existing-directory"
+        destination.mkdir()
+        existing_file = destination / "keep.txt"
+        existing_file.write_text("do not replace")
+
+        result = self.run_copy(
+            "--dry-run", "--no-clobber", self.source / "keep.txt", destination
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Would skip existing destination", result.stdout)
+        self.assertEqual(existing_file.read_text(), "do not replace")
+
+    def test_dry_run_refuses_same_file_destination(self):
+        source = self.source / "keep.txt"
+
+        result = self.run_copy("--dry-run", source, source)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("same file", result.stderr)
+        self.assertEqual(source.read_text(), "existing content")
+
+    def test_dry_run_with_resume_does_not_create_partial_file(self):
+        destination = self.root / "resumable-target"
+
+        result = self.run_copy("--dry-run", "--resume", self.source / "keep.txt",
+                               destination)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Would copy", result.stdout)
+        self.assertFalse(destination.exists())
+        self.assertFalse(list(self.root.glob(".copy-resume-*")))
+
     def test_verifies_empty_small_and_large_files(self):
         for size in (0, 37, 256 * 1024 + 19):
             with self.subTest(size=size):

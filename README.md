@@ -42,6 +42,7 @@ Examples:
 ./copy -c large-archive.tar archive-copy.tar
 ./copy -g video.mp4 /mnt/backup/
 ./copy --resume -r ./data /media/backup/data
+./copy --dry-run -r ./project /backup
 ./copy -rpnv project/ project-backup/
 ./copy -rpcvg project/ project-backup/
 ```
@@ -58,7 +59,8 @@ files before comparing their contents. With `--resume`, interrupted regular-file
 copies can be continued from a hidden partial file next to the destination. The
 completed file is verified before it replaces the destination; mismatched
 partial data is discarded and recopied. The destination must be a regular file
-(not a symbolic link) when resuming.
+(not a symbolic link) when resuming. `--dry-run` lists planned file, link, and
+directory operations without creating, replacing, or deleting anything.
 
 ## Install
 
