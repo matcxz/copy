@@ -1,6 +1,9 @@
 #include "common.h"
 
 #include "options.h"
+#include "util.h"
+
+#include "util.c"
 
 typedef struct {
     bool enabled;
@@ -11,7 +14,7 @@ typedef struct {
     int last_percent;
 } Progress;
 
-static const char *program_name = "copy";
+const char *program_name = "copy";
 
 static void print_usage(FILE *stream)
 {
@@ -35,72 +38,6 @@ static void print_usage(FILE *stream)
             program_name);
 }
 
-static void print_error(const char *path, const char *action)
-{
-    fprintf(stderr, "%s: %s '%s': %s\n", program_name, action, path,
-            strerror(errno));
-}
-
-static void print_dry_run(const char *action, const char *source,
-                          const char *destination)
-{
-    if (destination == NULL) {
-        printf("Would %s '%s'\n", action, source);
-    } else {
-        printf("Would %s '%s' -> '%s'\n", action, source, destination);
-    }
-}
-
-static char *join_path(const char *left, const char *right)
-{
-    size_t left_len = strlen(left);
-    size_t right_len = strlen(right);
-    bool separator_needed = left_len > 0 && left[left_len - 1] != '/';
-
-    if (left_len > SIZE_MAX - right_len - (separator_needed ? 2 : 1)) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-
-    size_t length = left_len + right_len + (separator_needed ? 1 : 0) + 1;
-    char *joined = malloc(length);
-    if (joined == NULL) {
-        return NULL;
-    }
-    snprintf(joined, length, "%s%s%s", left,
-             separator_needed ? "/" : "", right);
-    return joined;
-}
-
-static char *path_basename(const char *path)
-{
-    size_t length = strlen(path);
-    while (length > 1 && path[length - 1] == '/') {
-        length--;
-    }
-    size_t start = length;
-    while (start > 0 && path[start - 1] != '/') {
-        start--;
-    }
-    if (start == length) {
-        return strdup("/");
-    }
-    size_t name_length = length - start;
-    char *name = malloc(name_length + 1);
-    if (name == NULL) {
-        return NULL;
-    }
-    memcpy(name, path + start, name_length);
-    name[name_length] = '\0';
-    return name;
-}
-
-static bool same_file(const struct stat *source, const struct stat *destination)
-{
-    return source->st_dev == destination->st_dev &&
-           source->st_ino == destination->st_ino;
-}
-
 static int set_file_metadata(int fd, const struct stat *source,
                              const char *path, bool preserve)
 {
@@ -108,12 +45,12 @@ static int set_file_metadata(int fd, const struct stat *source,
         return 0;
     }
     if (fchmod(fd, source->st_mode & 07777) < 0) {
-        print_error(path, "cannot preserve permissions for");
+        copy_print_error(path, "cannot preserve permissions for");
         return -1;
     }
     struct timespec times[2] = {source->st_atim, source->st_mtim};
     if (futimens(fd, times) < 0) {
-        print_error(path, "cannot preserve timestamps for");
+        copy_print_error(path, "cannot preserve timestamps for");
         return -1;
     }
     return 0;
@@ -129,7 +66,7 @@ static ssize_t read_block_at(int fd, unsigned char *buffer, size_t capacity,
                               offset + (off_t)total);
         if (count < 0) {
             if (errno == EINTR) continue;
-            print_error(path, action);
+            copy_print_error(path, action);
             return -1;
         }
         if (count == 0) break;
@@ -183,20 +120,20 @@ static int prepare_disk_verification(int source_fd, int destination_fd,
                                      const char *destination)
 {
     if (fsync(destination_fd) < 0) {
-        print_error(destination, "cannot sync before verification");
+        copy_print_error(destination, "cannot sync before verification");
         return -1;
     }
     int advice_result = posix_fadvise(destination_fd, 0, 0,
                                       POSIX_FADV_DONTNEED);
     if (advice_result != 0) {
         errno = advice_result;
-        print_error(destination, "cannot discard cached data for");
+        copy_print_error(destination, "cannot discard cached data for");
         return -1;
     }
     advice_result = posix_fadvise(source_fd, 0, 0, POSIX_FADV_DONTNEED);
     if (advice_result != 0) {
         errno = advice_result;
-        print_error(source, "cannot discard cached data for");
+        copy_print_error(source, "cannot discard cached data for");
         return -1;
     }
     return 0;
@@ -218,12 +155,12 @@ static int copy_range_buffered(int source_fd, int destination_fd,
         ssize_t count = pread(source_fd, buffer, requested, source_offset);
         if (count < 0) {
             if (errno == EINTR) continue;
-            print_error(source, "cannot read");
+            copy_print_error(source, "cannot read");
             return -1;
         }
         if (count == 0) {
             errno = EIO;
-            print_error(source, "cannot read");
+            copy_print_error(source, "cannot read");
             return -1;
         }
 
@@ -234,12 +171,12 @@ static int copy_range_buffered(int source_fd, int destination_fd,
                                      destination_offset + written_total);
             if (written < 0) {
                 if (errno == EINTR) continue;
-                print_error(destination, "cannot write");
+                copy_print_error(destination, "cannot write");
                 return -1;
             }
             if (written == 0) {
                 errno = EIO;
-                print_error(destination, "cannot write");
+                copy_print_error(destination, "cannot write");
                 return -1;
             }
             written_total += written;
@@ -274,7 +211,7 @@ static int copy_range(int source_fd, int destination_fd, off_t source_offset,
                     destination_offset, remaining, source, destination,
                     progress);
             }
-            print_error(destination, "cannot copy data to");
+            copy_print_error(destination, "cannot copy data to");
             return -1;
         }
         if (copied == 0) {
@@ -309,7 +246,7 @@ static int copy_file_contents(int source_fd, int destination_fd,
                 sparse_supported = false;
                 break;
             }
-            print_error(source, "cannot locate file data in");
+            copy_print_error(source, "cannot locate file data in");
             return -1;
         }
         if (data_offset >= file_size) {
@@ -325,12 +262,12 @@ static int copy_file_contents(int source_fd, int destination_fd,
                 sparse_supported = false;
                 break;
             }
-            print_error(source, "cannot locate file hole in");
+            copy_print_error(source, "cannot locate file hole in");
             return -1;
         }
         if (hole_offset <= data_offset) {
             errno = EIO;
-            print_error(source, "cannot locate file hole in");
+            copy_print_error(source, "cannot locate file hole in");
             return -1;
         }
         if (hole_offset > file_size) hole_offset = file_size;
@@ -350,7 +287,7 @@ static int copy_file_contents(int source_fd, int destination_fd,
         return -1;
     }
     if (ftruncate(destination_fd, file_size) < 0) {
-        print_error(destination, "cannot set file size for");
+        copy_print_error(destination, "cannot set file size for");
         return -1;
     }
     return 0;
@@ -430,7 +367,7 @@ static char *resume_temporary_path(const char *destination)
     char temporary_name[40];
     snprintf(temporary_name, sizeof temporary_name,
              ".copy-resume-%016" PRIx64, hash);
-    char *result = join_path(parent, temporary_name);
+    char *result = copy_join_path(parent, temporary_name);
     free(copy);
     return result;
 }
@@ -530,20 +467,20 @@ static int copy_regular_file_resumable(const char *source,
             int existing_fd = open(destination,
                                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
             if (existing_fd < 0) {
-                print_error(destination, "cannot open existing destination");
+                copy_print_error(destination, "cannot open existing destination");
                 close(source_fd);
                 return -1;
             }
             struct stat existing_opened_stat;
             if (fstat(existing_fd, &existing_opened_stat) < 0) {
-                print_error(destination, "cannot inspect existing destination");
+                copy_print_error(destination, "cannot inspect existing destination");
                 close(existing_fd);
                 close(source_fd);
                 return -1;
             }
             if (!S_ISREG(existing_opened_stat.st_mode)) {
                 errno = ESTALE;
-                print_error(destination, "cannot inspect existing destination");
+                copy_print_error(destination, "cannot inspect existing destination");
                 close(existing_fd);
                 close(source_fd);
                 return -1;
@@ -559,11 +496,11 @@ static int copy_regular_file_resumable(const char *source,
             if (equal == 1) {
                 struct stat source_after;
                 if (fstat(source_fd, &source_after) < 0) {
-                    print_error(source, "cannot inspect after verification");
+                    copy_print_error(source, "cannot inspect after verification");
                     equal = -1;
                 } else if (!same_source_version(source_stat, &source_after)) {
                     errno = ESTALE;
-                    print_error(source, "changed during verification");
+                    copy_print_error(source, "changed during verification");
                     equal = -1;
                 }
             }
@@ -581,15 +518,15 @@ static int copy_regular_file_resumable(const char *source,
                 }
                 if (result == 0 && options->preserve &&
                     fsync(existing_fd) < 0) {
-                    print_error(destination, "cannot sync preserved file");
+                    copy_print_error(destination, "cannot sync preserved file");
                     result = -1;
                 }
                 if (close(existing_fd) < 0 && result == 0) {
-                    print_error(destination, "cannot close");
+                    copy_print_error(destination, "cannot close");
                     result = -1;
                 }
                 if (close(source_fd) < 0 && result == 0) {
-                    print_error(source, "cannot close");
+                    copy_print_error(source, "cannot close");
                     result = -1;
                 }
                 if (result < 0) return -1;
@@ -602,34 +539,34 @@ static int copy_regular_file_resumable(const char *source,
                 return 0;
             }
             if (close(existing_fd) < 0) {
-                print_error(destination, "cannot close");
+                copy_print_error(destination, "cannot close");
                 close(source_fd);
                 return -1;
             }
         }
     } else if (errno != ENOENT) {
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         close(source_fd);
         return -1;
     }
 
     char *partial_path = resume_temporary_path(destination);
     if (partial_path == NULL) {
-        print_error(destination, "cannot create resume path for");
+        copy_print_error(destination, "cannot create resume path for");
         close(source_fd);
         return -1;
     }
     int partial_fd = open(partial_path,
                           O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (partial_fd < 0) {
-        print_error(partial_path, "cannot open resume file");
+        copy_print_error(partial_path, "cannot open resume file");
         free(partial_path);
         close(source_fd);
         return -1;
     }
     struct stat partial_stat;
     if (fstat(partial_fd, &partial_stat) < 0) {
-        print_error(partial_path, "cannot inspect resume file");
+        copy_print_error(partial_path, "cannot inspect resume file");
         close(partial_fd);
         free(partial_path);
         close(source_fd);
@@ -638,14 +575,14 @@ static int copy_regular_file_resumable(const char *source,
     if (!S_ISREG(partial_stat.st_mode) || partial_stat.st_uid != geteuid() ||
         partial_stat.st_nlink != 1) {
         errno = EPERM;
-        print_error(partial_path, "unsafe resume file");
+        copy_print_error(partial_path, "unsafe resume file");
         close(partial_fd);
         free(partial_path);
         close(source_fd);
         return -1;
     }
     if (flock(partial_fd, LOCK_EX | LOCK_NB) < 0) {
-        print_error(partial_path, "resume file is already in use");
+        copy_print_error(partial_path, "resume file is already in use");
         close(partial_fd);
         free(partial_path);
         close(source_fd);
@@ -668,7 +605,7 @@ static int copy_regular_file_resumable(const char *source,
     }
     if (prefix_matches == 0) {
         if (ftruncate(partial_fd, 0) < 0) {
-            print_error(partial_path, "cannot restart resume file");
+            copy_print_error(partial_path, "cannot restart resume file");
             close(partial_fd);
             free(partial_path);
             close(source_fd);
@@ -691,11 +628,11 @@ static int copy_regular_file_resumable(const char *source,
     if (result == 0) {
         struct stat source_after;
         if (fstat(source_fd, &source_after) < 0) {
-            print_error(source, "cannot inspect after copy");
+            copy_print_error(source, "cannot inspect after copy");
             result = -1;
         } else if (!same_source_version(source_stat, &source_after)) {
             errno = ESTALE;
-            print_error(source, "changed during copy");
+            copy_print_error(source, "changed during copy");
             result = -1;
         }
     }
@@ -708,16 +645,16 @@ static int copy_regular_file_resumable(const char *source,
         umask(mask);
         mode_t mode = (source_stat->st_mode & 0777) & ~mask;
         if (fchmod(partial_fd, mode) < 0) {
-            print_error(partial_path, "cannot set permissions for");
+            copy_print_error(partial_path, "cannot set permissions for");
             result = -1;
         }
     }
     if (result == 0 && fsync(partial_fd) < 0) {
-        print_error(partial_path, "cannot sync resume file");
+        copy_print_error(partial_path, "cannot sync resume file");
         result = -1;
     }
     if (close(source_fd) < 0 && result == 0) {
-        print_error(source, "cannot close");
+        copy_print_error(source, "cannot close");
         result = -1;
     }
     bool published = false;
@@ -728,7 +665,7 @@ static int copy_regular_file_resumable(const char *source,
             if (publish_result == 0) {
                 published = true;
                 if (unlink(partial_path) < 0) {
-                    print_error(partial_path, "cannot remove published resume file");
+                    copy_print_error(partial_path, "cannot remove published resume file");
                     publish_result = -1;
                 }
             }
@@ -737,15 +674,15 @@ static int copy_regular_file_resumable(const char *source,
             published = publish_result == 0;
         }
         if (publish_result < 0) {
-            print_error(destination, "cannot publish completed copy to");
+            copy_print_error(destination, "cannot publish completed copy to");
             result = -1;
         } else if (sync_parent_directory(destination) < 0) {
-            print_error(destination, "cannot sync destination directory for");
+            copy_print_error(destination, "cannot sync destination directory for");
             result = -1;
         }
     }
     if (close(partial_fd) < 0 && result == 0) {
-        print_error(partial_path, "cannot close resume file");
+        copy_print_error(partial_path, "cannot close resume file");
         result = -1;
     }
     if (result == 0) {
@@ -768,7 +705,7 @@ static int copy_stream_contents(int source_fd, int destination_fd,
         ssize_t count = read(source_fd, buffer, sizeof buffer);
         if (count < 0) {
             if (errno == EINTR) continue;
-            print_error(source, "cannot read");
+            copy_print_error(source, "cannot read");
             return -1;
         }
         if (count == 0) return 0;
@@ -779,12 +716,12 @@ static int copy_stream_contents(int source_fd, int destination_fd,
                                     (size_t)(count - offset));
             if (written < 0) {
                 if (errno == EINTR) continue;
-                print_error(destination, "cannot write");
+                copy_print_error(destination, "cannot write");
                 return -1;
             }
             if (written == 0) {
                 errno = EIO;
-                print_error(destination, "cannot write");
+                copy_print_error(destination, "cannot write");
                 return -1;
             }
             offset += written;
@@ -798,7 +735,7 @@ static int reject_dangling_destination(const char *destination)
     struct stat link_stat;
     if (lstat(destination, &link_stat) < 0) {
         if (errno == ENOENT) return 0;
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         return -1;
     }
     if (!S_ISLNK(link_stat.st_mode)) return 0;
@@ -811,7 +748,7 @@ static int reject_dangling_destination(const char *destination)
                 program_name, destination);
         return -1;
     }
-    print_error(destination, "cannot inspect symbolic link target for");
+    copy_print_error(destination, "cannot inspect symbolic link target for");
     return -1;
 }
 
@@ -825,24 +762,24 @@ static int copy_regular_file(const char *source, const char *destination,
         struct stat destination_lstat;
         bool destination_exists = lstat(destination, &destination_lstat) == 0;
         if (!destination_exists && errno != ENOENT) {
-            print_error(destination, "cannot inspect");
+            copy_print_error(destination, "cannot inspect");
             return -1;
         }
         struct stat destination_stat;
         bool destination_is_directory = false;
         if (stat(destination, &destination_stat) == 0) {
-            if (same_file(source_stat, &destination_stat)) {
+            if (copy_same_file(source_stat, &destination_stat)) {
                 fprintf(stderr, "%s: '%s' and '%s' are the same file\n",
                         program_name, source, destination);
                 return -1;
             }
             destination_is_directory = S_ISDIR(destination_stat.st_mode);
         } else if (errno != ENOENT) {
-            print_error(destination, "cannot inspect");
+            copy_print_error(destination, "cannot inspect");
             return -1;
         }
         if (options->no_clobber && destination_exists) {
-            print_dry_run("skip existing destination", destination, NULL);
+            copy_print_dry_run("skip existing destination", destination, NULL);
             progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
             progress_mark_file(progress);
             return 0;
@@ -860,7 +797,7 @@ static int copy_regular_file(const char *source, const char *destination,
                     program_name, destination);
             return -1;
         }
-        print_dry_run("copy", source, destination);
+        copy_print_dry_run("copy", source, destination);
         progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
         progress_mark_file(progress);
         return 0;
@@ -868,26 +805,26 @@ static int copy_regular_file(const char *source, const char *destination,
 
     int source_fd = open(source, O_RDONLY | O_NOFOLLOW);
     if (source_fd < 0) {
-        print_error(source, "cannot open");
+        copy_print_error(source, "cannot open");
         return -1;
     }
 
     struct stat opened_stat;
     if (fstat(source_fd, &opened_stat) < 0) {
-        print_error(source, "cannot inspect");
+        copy_print_error(source, "cannot inspect");
         close(source_fd);
         return -1;
     }
     if (!S_ISREG(opened_stat.st_mode)) {
         errno = EINVAL;
-        print_error(source, "not a regular file");
+        copy_print_error(source, "not a regular file");
         close(source_fd);
         return -1;
     }
 
     struct stat destination_stat;
     if (stat(destination, &destination_stat) == 0) {
-        if (same_file(&opened_stat, &destination_stat)) {
+        if (copy_same_file(&opened_stat, &destination_stat)) {
             fprintf(stderr, "%s: '%s' and '%s' are the same file\n",
                     program_name, source, destination);
             close(source_fd);
@@ -901,7 +838,7 @@ static int copy_regular_file(const char *source, const char *destination,
             return -1;
         }
     } else if (errno != ENOENT) {
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         close(source_fd);
         return -1;
     }
@@ -925,14 +862,14 @@ static int copy_regular_file(const char *source, const char *destination,
             progress_mark_file(progress);
             return 0;
         }
-        print_error(destination, "cannot create");
+        copy_print_error(destination, "cannot create");
         close(source_fd);
         return -1;
     }
 
     struct stat destination_opened_stat;
     if (fstat(destination_fd, &destination_opened_stat) < 0) {
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         close(destination_fd);
         close(source_fd);
         return -1;
@@ -965,11 +902,11 @@ static int copy_regular_file(const char *source, const char *destination,
         result = -1;
     }
     if (close(destination_fd) < 0 && result == 0) {
-        print_error(destination, "cannot close");
+        copy_print_error(destination, "cannot close");
         result = -1;
     }
     if (close(source_fd) < 0 && result == 0) {
-        print_error(source, "cannot close");
+        copy_print_error(source, "cannot close");
         result = -1;
     }
     if (result == 0) {
@@ -989,7 +926,7 @@ static int copy_symlink(const char *source, const char *destination,
         struct stat existing;
         if (lstat(destination, &existing) == 0) {
             if (options->no_clobber) {
-                print_dry_run("skip existing destination", destination, NULL);
+                copy_print_dry_run("skip existing destination", destination, NULL);
                 progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
                 progress_mark_file(progress);
                 return 0;
@@ -1001,10 +938,10 @@ static int copy_symlink(const char *source, const char *destination,
                 return -1;
             }
         } else if (errno != ENOENT) {
-            print_error(destination, "cannot inspect");
+            copy_print_error(destination, "cannot inspect");
             return -1;
         }
-        print_dry_run("copy symbolic link", source, destination);
+        copy_print_dry_run("copy symbolic link", source, destination);
         progress_add_bytes(progress, (uintmax_t)source_stat->st_size);
         progress_mark_file(progress);
         return 0;
@@ -1017,12 +954,12 @@ static int copy_symlink(const char *source, const char *destination,
     for (;;) {
         target = malloc(capacity + 1);
         if (target == NULL) {
-            print_error(source, "cannot allocate symbolic link target for");
+            copy_print_error(source, "cannot allocate symbolic link target for");
             return -1;
         }
         ssize_t length = readlink(source, target, capacity);
         if (length < 0) {
-            print_error(source, "cannot read symbolic link");
+            copy_print_error(source, "cannot read symbolic link");
             free(target);
             return -1;
         }
@@ -1034,7 +971,7 @@ static int copy_symlink(const char *source, const char *destination,
         target = NULL;
         if (capacity > SIZE_MAX / 2) {
             errno = ENAMETOOLONG;
-            print_error(source, "symbolic link target is too long for");
+            copy_print_error(source, "symbolic link target is too long for");
             return -1;
         }
         capacity *= 2;
@@ -1055,18 +992,18 @@ static int copy_symlink(const char *source, const char *destination,
             return -1;
         }
         if (unlink(destination) < 0) {
-            print_error(destination, "cannot replace");
+            copy_print_error(destination, "cannot replace");
             free(target);
             return -1;
         }
     } else if (errno != ENOENT) {
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         free(target);
         return -1;
     }
 
     if (symlink(target, destination) < 0) {
-        print_error(destination, "cannot create symbolic link");
+        copy_print_error(destination, "cannot create symbolic link");
         free(target);
         return -1;
     }
@@ -1075,7 +1012,7 @@ static int copy_symlink(const char *source, const char *destination,
     if (options->preserve) {
         struct timespec times[2] = {source_stat->st_atim, source_stat->st_mtim};
         if (utimensat(AT_FDCWD, destination, times, AT_SYMLINK_NOFOLLOW) < 0) {
-            print_error(destination, "cannot preserve symbolic link timestamps for");
+            copy_print_error(destination, "cannot preserve symbolic link timestamps for");
             return -1;
         }
     }
@@ -1096,7 +1033,7 @@ static int check_directory_destination(const char *source,
 {
     char *candidate = strdup(destination);
     if (candidate == NULL) {
-        print_error(destination, "cannot allocate path for");
+        copy_print_error(destination, "cannot allocate path for");
         return -1;
     }
 
@@ -1105,7 +1042,7 @@ static int check_directory_destination(const char *source,
         directory_fd = open(candidate, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (directory_fd >= 0) break;
         if (errno != ENOENT) {
-            print_error(candidate, "cannot inspect destination ancestor");
+            copy_print_error(candidate, "cannot inspect destination ancestor");
             free(candidate);
             return -1;
         }
@@ -1125,7 +1062,7 @@ static int check_directory_destination(const char *source,
         if (strcmp(candidate, ".") == 0) {
             directory_fd = open(candidate, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (directory_fd < 0) {
-                print_error(candidate, "cannot inspect destination ancestor");
+                copy_print_error(candidate, "cannot inspect destination ancestor");
                 free(candidate);
                 return -1;
             }
@@ -1137,7 +1074,7 @@ static int check_directory_destination(const char *source,
     for (;;) {
         struct stat current_stat;
         if (fstat(directory_fd, &current_stat) < 0) {
-            print_error(destination, "cannot inspect destination ancestor");
+            copy_print_error(destination, "cannot inspect destination ancestor");
             close(directory_fd);
             return -1;
         }
@@ -1153,13 +1090,13 @@ static int check_directory_destination(const char *source,
         int parent_fd = openat(directory_fd, "..",
                                O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (parent_fd < 0) {
-            print_error(destination, "cannot inspect destination ancestor");
+            copy_print_error(destination, "cannot inspect destination ancestor");
             close(directory_fd);
             return -1;
         }
         struct stat parent_stat;
         if (fstat(parent_fd, &parent_stat) < 0) {
-            print_error(destination, "cannot inspect destination ancestor");
+            copy_print_error(destination, "cannot inspect destination ancestor");
             close(parent_fd);
             close(directory_fd);
             return -1;
@@ -1193,7 +1130,7 @@ static int copy_directory(const char *source, const char *destination,
         return -1;
     }
     if (!destination_exists && errno != ENOENT) {
-        print_error(destination, "cannot inspect");
+        copy_print_error(destination, "cannot inspect");
         return -1;
     }
     if (check_directory_destination(source, destination, source_stat) < 0) {
@@ -1201,18 +1138,18 @@ static int copy_directory(const char *source, const char *destination,
     }
 
     if (options->dry_run) {
-        print_dry_run(destination_exists ? "merge directory" : "create directory",
+        copy_print_dry_run(destination_exists ? "merge directory" : "create directory",
                       source, destination);
     }
     if (!destination_exists && !options->dry_run &&
         mkdir(destination, (source_stat->st_mode & 0777) | 0700) < 0) {
-        print_error(destination, "cannot create directory");
+        copy_print_error(destination, "cannot create directory");
         return -1;
     }
 
     DIR *directory = opendir(source);
     if (directory == NULL) {
-        print_error(source, "cannot open directory");
+        copy_print_error(source, "cannot open directory");
         return -1;
     }
 
@@ -1223,7 +1160,7 @@ static int copy_directory(const char *source, const char *destination,
         entry = readdir(directory);
         if (entry == NULL) {
             if (errno != 0) {
-                print_error(source, "cannot read directory");
+                copy_print_error(source, "cannot read directory");
                 result = -1;
             }
             break;
@@ -1232,10 +1169,10 @@ static int copy_directory(const char *source, const char *destination,
             strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        char *source_child = join_path(source, entry->d_name);
-        char *destination_child = join_path(destination, entry->d_name);
+        char *source_child = copy_join_path(source, entry->d_name);
+        char *destination_child = copy_join_path(destination, entry->d_name);
         if (source_child == NULL || destination_child == NULL) {
-            print_error(source, "cannot allocate path for");
+            copy_print_error(source, "cannot allocate path for");
             free(source_child);
             free(destination_child);
             result = -1;
@@ -1248,19 +1185,19 @@ static int copy_directory(const char *source, const char *destination,
         free(destination_child);
     }
     if (closedir(directory) < 0) {
-        print_error(source, "cannot close directory");
+        copy_print_error(source, "cannot close directory");
         result = -1;
     }
 
     if (options->preserve && !options->dry_run) {
         if (chmod(destination, source_stat->st_mode & 07777) < 0) {
-            print_error(destination, "cannot preserve permissions for");
+            copy_print_error(destination, "cannot preserve permissions for");
             result = -1;
         } else {
             struct timespec times[2] = {source_stat->st_atim,
                                          source_stat->st_mtim};
             if (utimensat(AT_FDCWD, destination, times, 0) < 0) {
-                print_error(destination, "cannot preserve timestamps for");
+                copy_print_error(destination, "cannot preserve timestamps for");
                 result = -1;
             }
         }
@@ -1269,7 +1206,7 @@ static int copy_directory(const char *source, const char *destination,
         umask(mask);
         mode_t mode = (source_stat->st_mode & 0777) & ~mask;
         if (chmod(destination, mode) < 0) {
-            print_error(destination, "cannot set permissions for");
+            copy_print_error(destination, "cannot set permissions for");
             result = -1;
         }
     }
@@ -1284,7 +1221,7 @@ static int copy_entry(const char *source, const char *destination,
 {
     struct stat source_stat;
     if (lstat(source, &source_stat) < 0) {
-        print_error(source, "cannot access");
+        copy_print_error(source, "cannot access");
         return -1;
     }
 
@@ -1310,14 +1247,14 @@ static int add_progress_file(Progress *progress, const struct stat *file_stat,
 {
     if (file_stat->st_size < 0) {
         errno = EOVERFLOW;
-        print_error(path, "cannot determine size of");
+        copy_print_error(path, "cannot determine size of");
         return -1;
     }
     uintmax_t size = (uintmax_t)file_stat->st_size;
     if (UINTMAX_MAX - progress->total_bytes < size ||
         progress->total_files == SIZE_MAX) {
         errno = EOVERFLOW;
-        print_error(path, "too many bytes or files to track for");
+        copy_print_error(path, "too many bytes or files to track for");
         return -1;
     }
     progress->total_bytes += size;
@@ -1330,7 +1267,7 @@ static int scan_progress_tree(const char *path, bool recursive,
 {
     struct stat file_stat;
     if (lstat(path, &file_stat) < 0) {
-        print_error(path, "cannot access while calculating progress for");
+        copy_print_error(path, "cannot access while calculating progress for");
         return -1;
     }
     if (S_ISREG(file_stat.st_mode) || S_ISLNK(file_stat.st_mode)) {
@@ -1342,7 +1279,7 @@ static int scan_progress_tree(const char *path, bool recursive,
 
     DIR *directory = opendir(path);
     if (directory == NULL) {
-        print_error(path, "cannot open while calculating progress for");
+        copy_print_error(path, "cannot open while calculating progress for");
         return -1;
     }
 
@@ -1352,7 +1289,7 @@ static int scan_progress_tree(const char *path, bool recursive,
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
             if (errno != 0) {
-                print_error(path, "cannot read while calculating progress for");
+                copy_print_error(path, "cannot read while calculating progress for");
                 result = -1;
             }
             break;
@@ -1361,9 +1298,9 @@ static int scan_progress_tree(const char *path, bool recursive,
             strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        char *child = join_path(path, entry->d_name);
+        char *child = copy_join_path(path, entry->d_name);
         if (child == NULL) {
-            print_error(path, "cannot allocate progress path for");
+            copy_print_error(path, "cannot allocate progress path for");
             result = -1;
             continue;
         }
@@ -1373,7 +1310,7 @@ static int scan_progress_tree(const char *path, bool recursive,
         free(child);
     }
     if (closedir(directory) < 0) {
-        print_error(path, "cannot close while calculating progress for");
+        copy_print_error(path, "cannot close while calculating progress for");
         result = -1;
     }
     return result;
@@ -1411,19 +1348,19 @@ static int main_copy(int argc, char **argv, const Options *options)
         const char *source = argv[index];
         char *target = NULL;
         if (destination_is_directory) {
-            char *base = path_basename(source);
+            char *base = copy_path_basename(source);
             if (base == NULL) {
-                print_error(source, "cannot allocate destination name for");
+                copy_print_error(source, "cannot allocate destination name for");
                 failures++;
                 continue;
             }
-            target = join_path(destination, base);
+            target = copy_join_path(destination, base);
             free(base);
         } else {
             target = strdup(destination);
         }
         if (target == NULL) {
-            print_error(destination, "cannot allocate destination path for");
+            copy_print_error(destination, "cannot allocate destination path for");
             failures++;
             continue;
         }
@@ -1444,7 +1381,7 @@ static int main_copy(int argc, char **argv, const Options *options)
         }
         seen_targets[seen_count] = strdup(target);
         if (seen_targets[seen_count] == NULL) {
-            print_error(target, "cannot remember destination for");
+            copy_print_error(target, "cannot remember destination for");
             failures++;
             free(target);
             continue;
