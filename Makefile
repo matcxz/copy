@@ -4,14 +4,19 @@ WARNFLAGS := -std=c11 -Wall -Wextra -Wpedantic
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 TARGET := copy
-SOURCE := src/copy.c
+SOURCES := $(wildcard src/*.c)
+OBJECTS := $(SOURCES:.c=.o)
+DEPFILES := $(OBJECTS:.o=.d)
 
 .PHONY: all clean install uninstall test check
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCE)
-	$(CC) $(WARNFLAGS) $(CFLAGS) $(SOURCE) -o $@
+$(TARGET): $(OBJECTS)
+	$(CC) $(WARNFLAGS) $(CFLAGS) $(OBJECTS) -o $@
+
+src/%.o: src/%.c
+	$(CC) $(WARNFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
@@ -22,9 +27,9 @@ uninstall:
 test: $(TARGET)
 	COPY_BIN="$(CURDIR)/$(TARGET)" python3 -m unittest discover -s tests -v
 
-$(TARGET)-asan: $(SOURCE)
+$(TARGET)-asan: $(SOURCES) $(wildcard src/*.h)
 	$(CC) $(WARNFLAGS) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-g -O1 $(SOURCE) -o $@
+		-g -O1 $(SOURCES) -o $@
 
 check: $(TARGET)-asan
 	COPY_BIN="$(CURDIR)/$(TARGET)-asan" \
@@ -33,4 +38,6 @@ check: $(TARGET)-asan
 		python3 -m unittest discover -s tests -v
 
 clean:
-	rm -f $(TARGET) $(TARGET)-asan
+	rm -f $(TARGET) $(TARGET)-asan $(OBJECTS) $(DEPFILES)
+
+-include $(DEPFILES)

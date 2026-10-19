@@ -1,21 +1,9 @@
 #include "common.h"
 
-#include "file.h"
 #include "options.h"
 #include "progress.h"
-#include "resume.h"
-#include "transfer.h"
 #include "tree.h"
 #include "util.h"
-#include "verify.h"
-
-#include "file.c"
-#include "progress.c"
-#include "resume.c"
-#include "tree.c"
-#include "transfer.c"
-#include "util.c"
-#include "verify.c"
 
 const char *program_name = "copy";
 
