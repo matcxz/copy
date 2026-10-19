@@ -1,15 +1,6 @@
 #include "common.h"
 
-typedef struct {
-    bool recursive;
-    bool preserve;
-    bool no_clobber;
-    bool verbose;
-    bool verify;
-    bool progress;
-    bool resume;
-    bool dry_run;
-} Options;
+#include "options.h"
 
 typedef struct {
     bool enabled;
