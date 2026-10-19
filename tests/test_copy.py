@@ -28,6 +28,15 @@ class DirectoryCopyTests(unittest.TestCase):
             check=False,
         )
 
+    def run_copy_with_umask(self, mask, *arguments):
+        return subprocess.run(
+            [COPY, *map(str, arguments)],
+            capture_output=True,
+            text=True,
+            check=False,
+            preexec_fn=lambda: os.umask(mask),
+        )
+
     def assert_refused_without_changes(self, destination):
         result = self.run_copy("--recursive", self.source, destination)
 
@@ -46,6 +55,159 @@ class DirectoryCopyTests(unittest.TestCase):
 
     def test_refuses_existing_destination_that_is_source_directory(self):
         self.assert_refused_without_changes(self.root)
+
+    def test_new_file_modes_follow_source_and_umask(self):
+        for source_mode in (0o600, 0o755, 0o444):
+            for mask in (0o022, 0o077):
+                for resume in (False, True):
+                    with self.subTest(
+                        source_mode=oct(source_mode), mask=oct(mask), resume=resume
+                    ):
+                        source = self.root / "mode-source"
+                        destination = self.root / "mode-destination"
+                        source.write_text("mode test")
+                        source.chmod(source_mode)
+                        arguments = ["--resume"] if resume else []
+                        result = self.run_copy_with_umask(
+                            mask, *arguments, source, destination
+                        )
+
+                        self.assertEqual(
+                            result.returncode, 0,
+                            msg=f"stdout={result.stdout}\nstderr={result.stderr}",
+                        )
+                        self.assertEqual(
+                            destination.stat().st_mode & 0o777,
+                            source_mode & ~mask,
+                        )
+                        source.chmod(0o600)
+                        source.unlink()
+                        destination.unlink()
+
+    def test_new_directory_and_file_modes_follow_source_and_umask(self):
+        for mask in (0o022, 0o077):
+            for resume in (False, True):
+                with self.subTest(mask=oct(mask), resume=resume):
+                    source = self.root / "mode-tree"
+                    source.mkdir(exist_ok=True)
+                    source.chmod(0o700)
+                    source_file = source / "private"
+                    source_file.write_text("private")
+                    source_file.chmod(0o600)
+                    destination_parent = self.root / "mode-output"
+                    destination_parent.mkdir(exist_ok=True)
+                    arguments = ["--recursive"]
+                    if resume:
+                        arguments.append("--resume")
+                    result = self.run_copy_with_umask(
+                        mask, *arguments, source, destination_parent
+                    )
+                    destination = destination_parent / source.name
+
+                    self.assertEqual(
+                        result.returncode, 0,
+                        msg=f"stdout={result.stdout}\nstderr={result.stderr}",
+                    )
+                    self.assertEqual(
+                        destination.stat().st_mode & 0o777, 0o700 & ~mask
+                    )
+                    self.assertEqual(
+                        (destination / "private").stat().st_mode & 0o777,
+                        0o600 & ~mask,
+                    )
+                    (destination / "private").chmod(0o600)
+                    destination.chmod(0o700)
+                    (destination / "private").unlink()
+                    destination.rmdir()
+                    source_file.unlink()
+
+    def test_new_read_only_directory_is_writable_until_copy_finishes(self):
+        source = self.root / "read-only-source"
+        source.mkdir()
+        (source / "payload").write_text("copied through temporary permissions")
+        source.chmod(0o555)
+        destination_parent = self.root / "read-only-output"
+        destination_parent.mkdir()
+
+        result = self.run_copy_with_umask(
+            0o022, "--recursive", source, destination_parent
+        )
+        destination = destination_parent / source.name
+
+        self.assertEqual(
+            result.returncode, 0, msg=f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+        self.assertTrue((destination / "payload").is_file())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o555)
+        destination.chmod(0o700)
+        (destination / "payload").unlink()
+        destination.rmdir()
+        source.chmod(0o700)
+
+    def test_overwriting_existing_file_keeps_its_mode(self):
+        source = self.root / "mode-overwrite-source"
+        destination = self.root / "mode-overwrite-destination"
+        source.write_text("new content")
+        source.chmod(0o600)
+        destination.write_text("old content")
+        destination.chmod(0o640)
+
+        result = self.run_copy_with_umask(0o077, source, destination)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(destination.read_text(), "new content")
+
+    def test_overwriting_existing_directory_keeps_modes_without_preserve(self):
+        source = self.root / "existing-mode-source"
+        source.mkdir()
+        (source / "payload").write_text("new content")
+        source.chmod(0o700)
+        destination_parent = self.root / "existing-mode-output"
+        destination_parent.mkdir()
+        destination = destination_parent / source.name
+        destination.mkdir()
+        (destination / "payload").write_text("old content")
+        destination.chmod(0o750)
+        (destination / "payload").chmod(0o640)
+
+        result = self.run_copy_with_umask(
+            0o077, "--recursive", source, destination_parent
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o750)
+        self.assertEqual((destination / "payload").stat().st_mode & 0o777, 0o640)
+        self.assertEqual((destination / "payload").read_text(), "new content")
+
+    def test_preserve_keeps_exact_source_modes_with_restrictive_umask(self):
+        source = self.root / "preserve-mode-source"
+        source.write_text("preserved")
+        source.chmod(0o755)
+        destination = self.root / "preserve-mode-destination"
+
+        result = self.run_copy_with_umask(0o077, "--preserve", source, destination)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+
+        source_dir = self.root / "preserve-mode-tree"
+        source_dir.mkdir()
+        source_file = source_dir / "private"
+        source_file.write_text("private")
+        source_dir.chmod(0o700)
+        source_file.chmod(0o600)
+        destination_parent = self.root / "preserve-mode-tree-output"
+        destination_parent.mkdir()
+
+        result = self.run_copy_with_umask(
+            0o077, "--preserve", "--recursive", source_dir, destination_parent
+        )
+        copied_dir = destination_parent / source_dir.name
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(copied_dir.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((copied_dir / "private").stat().st_mode & 0o777, 0o600)
 
     def test_dry_run_file_copy_does_not_create_or_modify_destination(self):
         destination = self.root / "planned-copy.txt"

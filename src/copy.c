@@ -733,7 +733,8 @@ static int copy_regular_file_resumable(const char *source,
     if (result == 0 && !options->preserve) {
         mode_t mask = umask(0);
         umask(mask);
-        if (fchmod(partial_fd, 0666 & ~mask) < 0) {
+        mode_t mode = (source_stat->st_mode & 0777) & ~mask;
+        if (fchmod(partial_fd, mode) < 0) {
             print_error(partial_path, "cannot set permissions for");
             result = -1;
         }
@@ -878,7 +879,7 @@ static int copy_regular_file(const char *source, const char *destination,
     } else {
         flags |= O_TRUNC;
     }
-    int destination_fd = open(destination, flags, 0666);
+    int destination_fd = open(destination, flags, source_stat->st_mode & 0777);
     if (destination_fd < 0) {
         if (options->no_clobber && errno == EEXIST) {
             close(source_fd);
@@ -1146,7 +1147,7 @@ static int copy_directory(const char *source, const char *destination,
                       source, destination);
     }
     if (!destination_exists && !options->dry_run &&
-        mkdir(destination, 0777) < 0) {
+        mkdir(destination, (source_stat->st_mode & 0777) | 0700) < 0) {
         print_error(destination, "cannot create directory");
         return -1;
     }
@@ -1204,6 +1205,14 @@ static int copy_directory(const char *source, const char *destination,
                 print_error(destination, "cannot preserve timestamps for");
                 result = -1;
             }
+        }
+    } else if (!options->dry_run && !destination_exists) {
+        mode_t mask = umask(0);
+        umask(mask);
+        mode_t mode = (source_stat->st_mode & 0777) & ~mask;
+        if (chmod(destination, mode) < 0) {
+            print_error(destination, "cannot set permissions for");
+            result = -1;
         }
     }
     if (result == 0 && options->verbose && !options->dry_run) {
