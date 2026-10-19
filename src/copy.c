@@ -1404,6 +1404,12 @@ static int main_copy(int argc, char **argv, const Options *options)
     }
 
     int failures = 0;
+    char **seen_targets = calloc((size_t)source_count, sizeof *seen_targets);
+    if (seen_targets == NULL) {
+        perror(program_name);
+        return 1;
+    }
+    int seen_count = 0;
     for (int index = 0; index < source_count; index++) {
         const char *source = argv[index];
         char *target = NULL;
@@ -1424,6 +1430,29 @@ static int main_copy(int argc, char **argv, const Options *options)
             failures++;
             continue;
         }
+        bool duplicate_target = false;
+        for (int seen = 0; seen < seen_count; seen++) {
+            if (strcmp(target, seen_targets[seen]) == 0) {
+                duplicate_target = true;
+                break;
+            }
+        }
+        if (duplicate_target) {
+            fprintf(stderr,
+                    "%s: multiple sources resolve to destination '%s'\n",
+                    program_name, target);
+            failures++;
+            free(target);
+            continue;
+        }
+        seen_targets[seen_count] = strdup(target);
+        if (seen_targets[seen_count] == NULL) {
+            print_error(target, "cannot remember destination for");
+            failures++;
+            free(target);
+            continue;
+        }
+        seen_count++;
 
         Progress progress = {
             .enabled = options->progress && !options->dry_run &&
@@ -1443,6 +1472,10 @@ static int main_copy(int argc, char **argv, const Options *options)
         if (progress.last_percent >= 0) fputc('\n', stderr);
         free(target);
     }
+    for (int index = 0; index < seen_count; index++) {
+        free(seen_targets[index]);
+    }
+    free(seen_targets);
     return failures == 0 ? 0 : 1;
 }
 

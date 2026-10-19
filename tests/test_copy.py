@@ -264,6 +264,22 @@ class DirectoryCopyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--resume requires a regular-file destination", result.stderr)
 
+    def test_multiple_sources_with_same_destination_name_are_refused(self):
+        first_source = self.root / "first" / "payload"
+        second_source = self.root / "second" / "payload"
+        first_source.parent.mkdir()
+        second_source.parent.mkdir()
+        first_source.write_text("first source")
+        second_source.write_text("second source")
+        destination = self.root / "output"
+        destination.mkdir()
+
+        result = self.run_copy(first_source, second_source, destination)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("multiple sources resolve to destination", result.stderr)
+        self.assertEqual((destination / "payload").read_text(), "first source")
+
     def test_dry_run_file_copy_does_not_create_or_modify_destination(self):
         destination = self.root / "planned-copy.txt"
         result = self.run_copy("--dry-run", self.source / "keep.txt", destination)
