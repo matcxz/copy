@@ -820,10 +820,34 @@ static int copy_stream_contents(int source_fd, int destination_fd,
     }
 }
 
+static int reject_dangling_destination(const char *destination)
+{
+    struct stat link_stat;
+    if (lstat(destination, &link_stat) < 0) {
+        if (errno == ENOENT) return 0;
+        print_error(destination, "cannot inspect");
+        return -1;
+    }
+    if (!S_ISLNK(link_stat.st_mode)) return 0;
+
+    struct stat target_stat;
+    if (stat(destination, &target_stat) == 0) return 0;
+    if (errno == ENOENT) {
+        fprintf(stderr,
+                "%s: refusing to follow dangling destination symbolic link '%s'\n",
+                program_name, destination);
+        return -1;
+    }
+    print_error(destination, "cannot inspect symbolic link target for");
+    return -1;
+}
+
 static int copy_regular_file(const char *source, const char *destination,
                              const struct stat *source_stat,
                              const Options *options, Progress *progress)
 {
+    if (reject_dangling_destination(destination) < 0) return -1;
+
     if (options->dry_run) {
         struct stat destination_lstat;
         bool destination_exists = lstat(destination, &destination_lstat) == 0;

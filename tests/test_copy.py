@@ -280,6 +280,20 @@ class DirectoryCopyTests(unittest.TestCase):
         self.assertIn("multiple sources resolve to destination", result.stderr)
         self.assertEqual((destination / "payload").read_text(), "first source")
 
+    def test_refuses_dangling_destination_symlink(self):
+        source = self.root / "dangling-source"
+        source.write_text("copied data")
+        destination = self.root / "dangling-link"
+        target = self.root / "dangling-target"
+        destination.symlink_to(target.name)
+
+        result = self.run_copy(source, destination)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dangling destination symbolic link", result.stderr)
+        self.assertTrue(destination.is_symlink())
+        self.assertFalse(target.exists())
+
     def test_dry_run_file_copy_does_not_create_or_modify_destination(self):
         destination = self.root / "planned-copy.txt"
         result = self.run_copy("--dry-run", self.source / "keep.txt", destination)
