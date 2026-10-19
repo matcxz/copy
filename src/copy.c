@@ -3,9 +3,11 @@
 #include "options.h"
 #include "progress.h"
 #include "util.h"
+#include "verify.h"
 
 #include "progress.c"
 #include "util.c"
+#include "verify.c"
 
 const char *program_name = "copy";
 
@@ -44,89 +46,6 @@ static int set_file_metadata(int fd, const struct stat *source,
     struct timespec times[2] = {source->st_atim, source->st_mtim};
     if (futimens(fd, times) < 0) {
         copy_print_error(path, "cannot preserve timestamps for");
-        return -1;
-    }
-    return 0;
-}
-
-static ssize_t read_block_at(int fd, unsigned char *buffer, size_t capacity,
-                             off_t offset, const char *path,
-                             const char *action)
-{
-    size_t total = 0;
-    while (total < capacity) {
-        ssize_t count = pread(fd, buffer + total, capacity - total,
-                              offset + (off_t)total);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            copy_print_error(path, action);
-            return -1;
-        }
-        if (count == 0) break;
-        total += (size_t)count;
-    }
-    return (ssize_t)total;
-}
-
-static int files_equal(int source_fd, int destination_fd,
-                       const char *source, const char *destination)
-{
-    unsigned char source_buffer[128 * 1024];
-    unsigned char destination_buffer[128 * 1024];
-    off_t offset = 0;
-    for (;;) {
-        ssize_t source_count = read_block_at(source_fd, source_buffer,
-                                             sizeof source_buffer, offset,
-                                             source, "cannot read while verifying");
-        if (source_count < 0) return -1;
-        ssize_t destination_count = read_block_at(
-            destination_fd, destination_buffer, sizeof destination_buffer,
-            offset, destination, "cannot read while verifying");
-        if (destination_count < 0) return -1;
-        if (source_count != destination_count ||
-            memcmp(source_buffer, destination_buffer,
-                   (size_t)source_count) != 0) {
-            return 0;
-        }
-        if (source_count == 0) {
-            return 1;
-        }
-        offset += source_count;
-    }
-}
-
-static int verify_contents(int source_fd, int destination_fd,
-                           const char *source, const char *destination)
-{
-    int equal = files_equal(source_fd, destination_fd, source, destination);
-    if (equal == 0) {
-        fprintf(stderr, "%s: verification failed for '%s'\n",
-                program_name, destination);
-        errno = EIO;
-        return -1;
-    }
-    return equal;
-}
-
-static int prepare_disk_verification(int source_fd, int destination_fd,
-                                     const char *source,
-                                     const char *destination)
-{
-    if (fsync(destination_fd) < 0) {
-        copy_print_error(destination, "cannot sync before verification");
-        return -1;
-    }
-    int advice_result = posix_fadvise(destination_fd, 0, 0,
-                                      POSIX_FADV_DONTNEED);
-    if (advice_result != 0) {
-        errno = advice_result;
-        copy_print_error(destination, "cannot discard cached data for");
-        return -1;
-    }
-    advice_result = posix_fadvise(source_fd, 0, 0, POSIX_FADV_DONTNEED);
-    if (advice_result != 0) {
-        errno = advice_result;
-        copy_print_error(source, "cannot discard cached data for");
         return -1;
     }
     return 0;
@@ -326,11 +245,11 @@ static int file_prefix_matches(int source_fd, int partial_fd, off_t length,
         size_t requested = (uintmax_t)(length - offset) > sizeof source_buffer
                                ? sizeof source_buffer
                                : (size_t)(length - offset);
-        ssize_t source_count = read_block_at(source_fd, source_buffer, requested,
+        ssize_t source_count = copy_read_block_at(source_fd, source_buffer, requested,
                                              offset, source,
                                              "cannot read while resuming");
         if (source_count < 0) return -1;
-        ssize_t partial_count = read_block_at(
+        ssize_t partial_count = copy_read_block_at(
             partial_fd, partial_buffer, requested, offset, partial_path,
             "cannot read resume file");
         if (partial_count < 0) return -1;
@@ -430,10 +349,10 @@ static int copy_regular_file_resumable(const char *source,
             }
             int equal = 0;
             if (existing_opened_stat.st_size == source_stat->st_size) {
-                equal = prepare_disk_verification(source_fd, existing_fd,
+                equal = copy_prepare_disk_verification(source_fd, existing_fd,
                                                   source, destination) < 0
                             ? -1
-                            : files_equal(source_fd, existing_fd, source,
+                            : copy_files_equal(source_fd, existing_fd, source,
                                           destination);
             }
             if (equal == 1) {
@@ -563,9 +482,9 @@ static int copy_regular_file_resumable(const char *source,
                                     progress);
 
     if (result == 0 &&
-        (prepare_disk_verification(source_fd, partial_fd, source,
+        (copy_prepare_disk_verification(source_fd, partial_fd, source,
                                    partial_path) < 0 ||
-         verify_contents(source_fd, partial_fd, source, partial_path) < 0)) {
+         copy_verify_contents(source_fd, partial_fd, source, partial_path) < 0)) {
         result = -1;
     }
     if (result == 0) {
@@ -834,9 +753,9 @@ static int copy_regular_file(const char *source, const char *destination,
                                             destination, progress);
 
     if (result == 0 && options->verify &&
-        (prepare_disk_verification(source_fd, destination_fd, source,
+        (copy_prepare_disk_verification(source_fd, destination_fd, source,
                                    destination) < 0 ||
-         verify_contents(source_fd, destination_fd, source, destination) < 0)) {
+         copy_verify_contents(source_fd, destination_fd, source, destination) < 0)) {
         result = -1;
     }
     if (result == 0 && S_ISREG(destination_opened_stat.st_mode) &&
